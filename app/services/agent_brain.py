@@ -62,11 +62,17 @@ class AgentSession:
 
 def _build_decision_prompt(job: dict, profile: dict) -> str:
     doc_lines = "\n".join(f'- {d["title"]} ({d["type"]})' for d in profile.get("documents", [])) or "(none)"
+    resume_text = profile.get("resume_text") or "(no readable resume text — rely on the about paragraph only)"
     return f"""You are deciding whether a candidate should apply to a job listing.
-Use ONLY the candidate information below — do not invent facts.
+Use ONLY the candidate information below — do not invent facts. Weigh the resume text more
+heavily than the about paragraph for concrete things like role titles, years of experience,
+and specific skills/technologies — it's the more precise source.
 
 CANDIDATE ABOUT:
 {profile.get("about_paragraph") or "(not provided)"}
+
+CANDIDATE RESUME TEXT:
+{resume_text}
 
 CANDIDATE DOCUMENTS ON FILE:
 {doc_lines}
