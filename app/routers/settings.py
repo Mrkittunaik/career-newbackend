@@ -6,6 +6,7 @@ from pydantic import BaseModel
 
 from app.core.config import settings as app_settings
 from app.core.db import get_db
+from app.core.field_encryption import encrypt_secret
 from app.core.security import generate_bot_token, get_current_user_id, hash_password, mask_token, verify_bot_token
 from app.services import gmail as gmail_service
 
@@ -121,8 +122,7 @@ async def update_ai_provider(body: UpdateAiProviderBody, user_id: str = Depends(
     db = get_db()
     update = {"ai_provider": body.ai_provider}
     if body.api_key:
-        # TODO: encrypt at rest (e.g. via a KMS-backed field encryption) before production use.
-        update["ai_api_key"] = body.api_key
+        update["ai_api_key"] = encrypt_secret(body.api_key)
     elif body.ai_provider == "ours":
         update["ai_api_key"] = None
     await db.settings.update_one({"user_id": user_id}, {"$set": update}, upsert=True)
