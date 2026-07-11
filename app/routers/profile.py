@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from app.core.db import get_core_db, get_user_db
 from app.core.security import get_current_user_id
+from app.services import resume_extract
 
 router = APIRouter(prefix="/profile", tags=["profile"])
 
@@ -113,6 +114,12 @@ async def add_document(request: Request, user_id: str = Depends(get_current_user
             metadata={"user_id": user_id, "content_type": upload.content_type},
         )
 
+        # Pull real text out of the file now, once, at upload time — so
+        # ai_brain never has to re-parse the PDF/DOCX on every single job
+        # application. Extraction never raises (see resume_extract.py); an
+        # empty string just means the AI falls back to about_paragraph only.
+        extracted_text = resume_extract.extract_text(upload.content_type, upload.filename, contents)
+
         doc = {
             "user_id": user_id,
             "title": title or upload.filename or "Untitled document",
@@ -120,6 +127,7 @@ async def add_document(request: Request, user_id: str = Depends(get_current_user
             "gridfs_id": gridfs_id,
             "filename": upload.filename or "resume",
             "content_type": upload.content_type,
+            "extracted_text": extracted_text,
             "created_at": datetime.now(timezone.utc),
         }
     else:
