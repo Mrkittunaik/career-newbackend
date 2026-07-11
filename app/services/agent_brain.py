@@ -31,7 +31,7 @@ from enum import Enum
 
 import httpx
 
-from app.core.db import get_db
+from app.core.db import get_user_db
 from app.services import ai_brain
 
 DECISION_TIMEOUT_SECONDS = 15
@@ -166,7 +166,7 @@ async def record_decision(user_id: str, job: dict, decision: JobDecision, reason
     can later show "why did it skip this one" instead of the decision
     vanishing the moment it's made.
     """
-    db = get_db()
+    db = await get_user_db(user_id)
     await db.job_decisions.insert_one(
         {
             "user_id": user_id,
@@ -190,7 +190,7 @@ async def already_decided(user_id: str, job: dict) -> dict | None:
     job_url = job.get("url")
     if not job_url:
         return None
-    db = get_db()
+    db = await get_user_db(user_id)
     return await db.job_decisions.find_one({"user_id": user_id, "url": job_url})
 
 
