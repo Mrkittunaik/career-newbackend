@@ -14,3 +14,4 @@ google-auth==2.37.0
 python-dotenv==1.0.1
 websockets==14.1
 email-validator==2.2.0
+cryptography==44.0.0
