@@ -6,7 +6,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.core.db import get_db
 from app.core.security import decode_access_token, verify_bot_token
-from app.services import ai_brain
+from app.services import ai_brain, agent_brain
 
 router = APIRouter(tags=["ws"])
 
@@ -242,6 +242,40 @@ async def bot_ws(websocket: WebSocket):
         )
         await websocket.send_text(json.dumps({"type": "report_ack", "payload": {"id": doc_id}}))
 
+    async def handle_job_decision(payload: dict):
+        """
+        New, additive message type: the bot sends this BEFORE scanning a
+        job's form fields, describing the job (title, company, description,
+        url). The agent decides apply/skip using agent_brain, persists the
+        decision (memory across sessions), and replies with job_decision_result
+        so the bot only proceeds to scan_fields if told to apply. Older bot
+        builds that never send job_decision simply keep using scan_fields
+        directly, unaffected by any of this.
+        """
+        nonlocal profile_cache
+        job = payload.get("job", {})
+        request_id = payload.get("request_id")
+
+        if profile_cache is None:
+            profile_cache = await ai_brain._load_profile_context(user_id)
+
+        existing = await agent_brain.already_decided(user_id, job)
+        if existing is not None:
+            decision, reason = existing["decision"], existing["reason"]
+        else:
+            decision_enum, reason = await agent_brain.decide_job(user_id, job, profile_cache)
+            decision = decision_enum.value
+            await agent_brain.record_decision(user_id, job, decision_enum, reason)
+
+        await websocket.send_text(
+            json.dumps(
+                {
+                    "type": "job_decision_result",
+                    "payload": {"request_id": request_id, "decision": decision, "reason": reason},
+                }
+            )
+        )
+
     try:
         while True:
             raw = await websocket.receive_text()
@@ -252,6 +286,8 @@ async def bot_ws(websocket: WebSocket):
             msg_type = msg.get("type")
             if msg_type == "pong":
                 last_pong = asyncio.get_event_loop().time()
+            elif msg_type == "job_decision":
+                await handle_job_decision(msg.get("payload", msg))
             elif msg_type == "scan_fields":
                 await handle_scan_fields(msg.get("payload", msg))
             elif msg_type == "report_result":
