@@ -4,7 +4,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
-from app.core.db import get_db
+from app.core.db import get_core_db
 from app.core.security import get_current_user_id
 from app.services import razorpay_client
 
@@ -26,7 +26,7 @@ async def create_order(body: CreateOrderBody, user_id: str = Depends(get_current
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
-    db = get_db()
+    db = get_core_db()
     await db.payments.insert_one(
         {
             "user_id": user_id,
@@ -61,7 +61,7 @@ async def razorpay_webhook(request: Request):
     entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
     order_id = entity.get("order_id")
 
-    db = get_db()
+    db = get_core_db()
     if order_id:
         new_status = "paid" if event == "payment.captured" else "failed"
         await db.payments.update_one({"order_id": order_id}, {"$set": {"status": new_status, "event": event}})
