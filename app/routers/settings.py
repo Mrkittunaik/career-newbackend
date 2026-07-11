@@ -5,8 +5,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
 from app.core.config import settings as app_settings
-from app.core.db import get_db
-from app.core.field_encryption import encrypt_secret
+from app.core.db import get_core_db
+from app.core.field_encryption import encrypt_secret, decrypt_secret
 from app.core.security import generate_bot_token, get_current_user_id, hash_password, mask_token, verify_bot_token
 from app.services import gmail as gmail_service
 
@@ -20,6 +20,7 @@ class ValidateTokenBody(BaseModel):
 class UpdateStorageModeBody(BaseModel):
     storage_mode: str  # "hosted" | "own"
     mongo_url: str | None = None
+    mongo_db_name: str | None = None
 
 
 class UpdateAiProviderBody(BaseModel):
@@ -27,7 +28,10 @@ class UpdateAiProviderBody(BaseModel):
     api_key: str | None = None
 
 
-def _mask_mongo_url(url: str | None) -> str | None:
+def _mask_mongo_url(encrypted_url: str | None) -> str | None:
+    if not encrypted_url:
+        return None
+    url = decrypt_secret(encrypted_url)
     if not url:
         return None
     # crude redaction of credentials in mongodb://user:pass@host form
@@ -41,25 +45,31 @@ def _mask_mongo_url(url: str | None) -> str | None:
 
 @router.get("/settings")
 async def get_settings(user_id: str = Depends(get_current_user_id)):
-    db = get_db()
+    db = get_core_db()
     doc = await db.settings.find_one({"user_id": user_id}) or {}
 
     return {
         "bot_online": doc.get("bot_online", False),
         "masked_bot_token": mask_token(doc["bot_token_plain_once"]) if doc.get("bot_token_plain_once") else None,
         "storage_mode": doc.get("storage_mode", "hosted"),
-        "mongo_url_masked": _mask_mongo_url(doc.get("mongo_url")),
+        "mongo_url_masked": _mask_mongo_url(doc.get("mongo_url_encrypted")),
         "ai_provider": doc.get("ai_provider", app_settings.default_ai_provider),
         "has_own_ai_key": bool(doc.get("ai_api_key")),
         "gmail_connected": doc.get("gmail_connected", False),
         "gmail_email": doc.get("gmail_email"),
         "gmail_last_checked": doc.get("gmail_last_checked"),
+        # Numbers only — the actual application/chat content lives in the
+        # user's own DB when storage_mode == "own"; these counters are
+        # account-level metadata, so they belong in the hosted DB alongside
+        # everything else in this document.
+        "applications_count": doc.get("applications_count", 0),
+        "chats_count": doc.get("chats_count", 0),
     }
 
 
 @router.post("/overlay/regenerate-token")
 async def regenerate_bot_token(user_id: str = Depends(get_current_user_id)):
-    db = get_db()
+    db = get_core_db()
     raw_token = generate_bot_token()
     await db.settings.update_one(
         {"user_id": user_id},
@@ -88,7 +98,7 @@ async def validate_bot_token(body: ValidateTokenBody):
     This is fine at CareerOS's current scale; if it becomes a bottleneck, switch
     to storing a fast lookup prefix/HMAC index alongside the bcrypt hash.
     """
-    db = get_db()
+    db = get_core_db()
     raw_token = body.token.strip()
     if not raw_token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
@@ -102,7 +112,7 @@ async def validate_bot_token(body: ValidateTokenBody):
 
 @router.post("/settings/storage")
 async def update_storage_mode(body: UpdateStorageModeBody, user_id: str = Depends(get_current_user_id)):
-    db = get_db()
+    db = get_core_db()
     if body.storage_mode not in ("hosted", "own"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="storage_mode must be 'hosted' or 'own'")
     if body.storage_mode == "own" and not body.mongo_url:
@@ -110,16 +120,19 @@ async def update_storage_mode(body: UpdateStorageModeBody, user_id: str = Depend
 
     update = {"storage_mode": body.storage_mode}
     if body.storage_mode == "own":
-        update["mongo_url"] = body.mongo_url
-        # NOTE: actually migrating this user's data to their own Mongo instance is a
-        # background job left as a TODO — this only records the preference for now.
+        # Encrypted at rest — a Mongo connection string contains the DB
+        # password in plaintext, so this can't be stored as-is (previously
+        # it was, which was a real credentials-exposure gap).
+        update["mongo_url_encrypted"] = encrypt_secret(body.mongo_url)
+        if body.mongo_db_name:
+            update["mongo_db_name"] = body.mongo_db_name
     await db.settings.update_one({"user_id": user_id}, {"$set": update}, upsert=True)
     return {"storage_mode": body.storage_mode}
 
 
 @router.post("/settings/ai-provider")
 async def update_ai_provider(body: UpdateAiProviderBody, user_id: str = Depends(get_current_user_id)):
-    db = get_db()
+    db = get_core_db()
     update = {"ai_provider": body.ai_provider}
     if body.api_key:
         update["ai_api_key"] = encrypt_secret(body.api_key)
@@ -137,7 +150,7 @@ async def get_gmail_connect_url(user_id: str = Depends(get_current_user_id)):
             detail="Gmail isn't configured yet on the server. Set GMAIL_CLIENT_ID/SECRET in .env.",
         )
     # `state` ties the OAuth callback back to this user; store it so /gmail/callback can verify it.
-    db = get_db()
+    db = get_core_db()
     state = secrets.token_urlsafe(24)
     await db.settings.update_one({"user_id": user_id}, {"$set": {"gmail_oauth_state": state}}, upsert=True)
     return {"oauth_url": gmail_service.build_oauth_url(state)}
@@ -145,7 +158,7 @@ async def get_gmail_connect_url(user_id: str = Depends(get_current_user_id)):
 
 @router.get("/settings/gmail/callback")
 async def gmail_oauth_callback(code: str, state: str):
-    db = get_db()
+    db = get_core_db()
     doc = await db.settings.find_one({"gmail_oauth_state": state})
     if doc is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired OAuth state")
@@ -169,7 +182,7 @@ async def gmail_oauth_callback(code: str, state: str):
 
 @router.post("/settings/gmail/disconnect")
 async def disconnect_gmail(user_id: str = Depends(get_current_user_id)):
-    db = get_db()
+    db = get_core_db()
     await db.settings.update_one(
         {"user_id": user_id},
         {
@@ -182,7 +195,7 @@ async def disconnect_gmail(user_id: str = Depends(get_current_user_id)):
 
 @router.post("/gmail/scan")
 async def trigger_gmail_scan(user_id: str = Depends(get_current_user_id)):
-    db = get_db()
+    db = get_core_db()
     doc = await db.settings.find_one({"user_id": user_id}) or {}
     if not doc.get("gmail_connected"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Gmail isn't connected yet")
