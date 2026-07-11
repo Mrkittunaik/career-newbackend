@@ -4,7 +4,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
 from app.core.db import ensure_indexes
-from app.routers import auth, dashboard, internal, jobs, payments, profile, settings as settings_router, ws
+from app.routers import auth, chat, dashboard, internal, jobs, payments, profile, settings as settings_router, ws
 
 app = FastAPI(title="CareerOS API")
 
@@ -23,6 +23,7 @@ API_PREFIX = "/api/v1"
 app.include_router(auth.router, prefix=API_PREFIX)
 app.include_router(profile.router, prefix=API_PREFIX)
 app.include_router(jobs.router, prefix=API_PREFIX)
+app.include_router(chat.router, prefix=API_PREFIX)
 app.include_router(dashboard.router, prefix=API_PREFIX)
 app.include_router(settings_router.router, prefix=API_PREFIX)
 app.include_router(payments.router, prefix=API_PREFIX)
