@@ -5,6 +5,7 @@ from pydantic import BaseModel
 
 from app.core.db import get_user_db, get_core_db
 from app.core.security import get_current_user_id
+from app.routers.ws import start_automation_session
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -43,16 +44,24 @@ async def submit_job_request(body: JobRequestBody, user_id: str = Depends(get_cu
         "status": "queued",
     }
     result = await db.job_requests.insert_one(doc)
-    # NOTE: the actual scanning/auto-apply bot is a separate worker process that should
-    # watch the `job_requests` collection (status == "queued") and write results into
-    # `job_applications` + push WebSocket events. This endpoint only enqueues the request.
+    request_id = str(result.inserted_id)
+
+    # If the bot is connected right now, drive it directly: build the first
+    # site's search URL and send open_site over /ws/bot. This replaces the
+    # old "a separate worker watches job_requests" plan, which was never
+    # actually built — the bot connects live and the backend controls it
+    # step by step instead. If the bot isn't online, the request just stays
+    # "queued" in Mongo (nothing lost — the user can retry once it's on).
+    started = await start_automation_session(user_id, request_id, body.job_type, body.experience_level, body.target_sites)
+    if started:
+        await db.job_requests.update_one({"_id": result.inserted_id}, {"$set": {"status": "processing"}})
 
     # Account-level usage counter (numbers only) lives in the hosted core DB
     # regardless of storage_mode — see db.py's split rationale.
     core_db = get_core_db()
     await core_db.settings.update_one({"user_id": user_id}, {"$inc": {"applications_count": 1}}, upsert=True)
 
-    return {"id": str(result.inserted_id), "status": "queued"}
+    return {"id": request_id, "status": "processing" if started else "queued", "bot_online": started}
 
 
 @router.get("")
