@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from app.core.db import get_db
+from app.core.db import get_core_db, get_user_db
 from app.core.security import decode_access_token, verify_bot_token
 from app.services import ai_brain, agent_brain
 
@@ -89,17 +89,19 @@ async def dashboard_ws(websocket: WebSocket):
 
 async def _mark_bot_status(user_id: str, online: bool):
     """Keep both collections in sync: bot_sessions (source of truth for A5/A6
-    heartbeat logic) and settings.bot_online (what GET /settings reads on
-    initial page load, per settings.py). Writing only one would leave the
-    other stale — GET /settings would show the wrong initial state."""
-    db = get_db()
+    heartbeat logic, per-user content DB) and settings.bot_online (what GET
+    /settings reads on initial page load, account-level, hosted core DB).
+    Writing only one would leave the other stale — GET /settings would show
+    the wrong initial state."""
+    user_db = await get_user_db(user_id)
+    core_db = get_core_db()
     now = datetime.now(timezone.utc)
-    await db.bot_sessions.update_one(
+    await user_db.bot_sessions.update_one(
         {"user_id": user_id},
         {"$set": {"online": online, "last_seen": now}},
         upsert=True,
     )
-    await db.settings.update_one(
+    await core_db.settings.update_one(
         {"user_id": user_id},
         {"$set": {"bot_online": online}},
         upsert=True,
@@ -120,8 +122,10 @@ async def bot_ws(websocket: WebSocket):
         return
 
     # Same lookup verify_bot_token/validate-token uses — hashed tokens mean we
-    # scan settings docs with a bot_token_hash and verify each.
-    db = get_db()
+    # scan settings docs with a bot_token_hash and verify each. settings is
+    # account-level, always the hosted core DB, and we don't know which
+    # user this is yet at this point anyway.
+    db = get_core_db()
     user_id = None
     async for doc in db.settings.find({"bot_token_hash": {"$exists": True}}):
         if verify_bot_token(raw_token, doc["bot_token_hash"]):
@@ -209,7 +213,7 @@ async def bot_ws(websocket: WebSocket):
         architecture decision to route all bot-originated events through
         /ws/bot instead.
         """
-        db = get_db()
+        db = await get_user_db(user_id)
         now = datetime.now(timezone.utc)
         doc = {
             "user_id": user_id,
