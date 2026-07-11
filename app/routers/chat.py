@@ -28,6 +28,7 @@ from pydantic import BaseModel
 
 from app.core.db import get_core_db, get_user_db
 from app.core.security import get_current_user_id
+from app.routers.ws import start_automation_session
 from app.services import agent_brain
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -175,6 +176,16 @@ async def send_chat_message(body: ChatMessageBody, user_id: str = Depends(get_cu
         }
         inserted = await db.job_requests.insert_one(job_doc)
         job_request_id = str(inserted.inserted_id)
+
+        # Same live-kickoff as the structured job-request form (jobs.py) —
+        # a chat-originated "find me frontend jobs" should behave exactly
+        # like filling out the form, not silently do less because it came
+        # through a different entry point.
+        started = await start_automation_session(
+            user_id, job_request_id, result["job_type"], result["experience_level"], result["target_sites"]
+        )
+        if started:
+            await db.job_requests.update_one({"_id": inserted.inserted_id}, {"$set": {"status": "processing"}})
 
         core_db = get_core_db()
         await core_db.settings.update_one({"user_id": user_id}, {"$inc": {"applications_count": 1}}, upsert=True)
