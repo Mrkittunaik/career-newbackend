@@ -71,19 +71,42 @@ async def _resolve_provider_and_key(user_id: str) -> tuple[str, str]:
     provider = doc.get("ai_provider", app_settings.default_ai_provider)
 
     if provider == "ours" or not doc.get("ai_api_key"):
-        # Shared platform key for the given provider, defaulting to anthropic.
+        # Shared platform key. Previously this hardcoded "anthropic" for the
+        # "ours" case, which silently produced an empty key for every user
+        # whenever only GROQ_API_KEY (or only OPENAI_API_KEY) was configured
+        # on the server and ANTHROPIC_API_KEY was left blank — the resolver
+        # would return provider="anthropic" with api_key="" and every AI call
+        # would look like "no key configured" even though a usable platform
+        # key existed. Instead, try each configured platform key in a fixed
+        # preference order and use whichever one is actually set.
         key_map = {
-            "openai": app_settings.openai_api_key,
-            "groq": app_settings.groq_api_key,
             "anthropic": app_settings.anthropic_api_key,
+            "groq": app_settings.groq_api_key,
+            "openai": app_settings.openai_api_key,
         }
-        return "anthropic", app_settings.anthropic_api_key if provider == "ours" else key_map.get(provider, "")
+        # If the user explicitly picked a non-"ours" provider but just has no
+        # personal key saved for it, respect that specific provider choice
+        # first (e.g. they chose "groq" -> try the platform's groq key).
+        if provider in key_map and key_map[provider]:
+            return provider, key_map[provider]
+        for candidate_provider, candidate_key in key_map.items():
+            if candidate_key:
+                return candidate_provider, candidate_key
+        return "anthropic", ""
 
     decrypted = decrypt_secret(doc["ai_api_key"])
     if decrypted is None:
-        # Corrupt/undecryptable key (e.g. FIELD_ENCRYPTION_KEY rotated) — fall
-        # back to the shared key rather than hard-failing the whole scan.
-        return "anthropic", app_settings.anthropic_api_key
+        # Corrupt/undecryptable key (e.g. FIELD_ENCRYPTION_KEY rotated) —
+        # fall back to whichever platform key is configured rather than
+        # hard-failing the whole scan.
+        for candidate_provider, candidate_key in (
+            ("anthropic", app_settings.anthropic_api_key),
+            ("groq", app_settings.groq_api_key),
+            ("openai", app_settings.openai_api_key),
+        ):
+            if candidate_key:
+                return candidate_provider, candidate_key
+        return "anthropic", ""
     return provider, decrypted
 
 
