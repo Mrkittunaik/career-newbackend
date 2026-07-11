@@ -6,10 +6,14 @@ from pydantic import BaseModel
 
 from app.core.config import settings as app_settings
 from app.core.db import get_db
-from app.core.security import generate_bot_token, get_current_user_id, hash_password, mask_token
+from app.core.security import generate_bot_token, get_current_user_id, hash_password, mask_token, verify_bot_token
 from app.services import gmail as gmail_service
 
 router = APIRouter(tags=["settings"])
+
+
+class ValidateTokenBody(BaseModel):
+    token: str
 
 
 class UpdateStorageModeBody(BaseModel):
@@ -71,6 +75,28 @@ async def regenerate_bot_token(user_id: str = Depends(get_current_user_id)):
     )
     # Returned once — the frontend shows this in a "copy now, you won't see it again" box.
     return {"token": raw_token}
+
+
+@router.post("/overlay/validate-token")
+async def validate_bot_token(body: ValidateTokenBody):
+    """
+    Called by the Electron bot's pairing screen (unauthenticated — the bot has no
+    JWT, only this raw token) and again on every /ws/bot connect/reconnect.
+    Since tokens are stored hashed, we can't look up by token value directly —
+    we scan settings docs that have a bot_token_hash and verify against each.
+    This is fine at CareerOS's current scale; if it becomes a bottleneck, switch
+    to storing a fast lookup prefix/HMAC index alongside the bcrypt hash.
+    """
+    db = get_db()
+    raw_token = body.token.strip()
+    if not raw_token:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    async for doc in db.settings.find({"bot_token_hash": {"$exists": True}}):
+        if verify_bot_token(raw_token, doc["bot_token_hash"]):
+            return {"valid": True, "user_id": doc["user_id"]}
+
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
 
 @router.post("/settings/storage")
