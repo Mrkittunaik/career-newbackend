@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
-from app.core.db import get_db
+from app.core.db import get_core_db, get_user_db
 from app.core.security import get_current_user_id
 from app.services import agent_brain
 
@@ -42,14 +42,14 @@ def _serialize(msg: dict) -> dict:
 
 @router.get("/history")
 async def get_chat_history(user_id: str = Depends(get_current_user_id)):
-    db = get_db()
+    db = await get_user_db(user_id)
     msgs = await db.chat_messages.find({"user_id": user_id}).sort("created_at", 1).to_list(length=HISTORY_LIMIT)
     return [_serialize(m) for m in msgs]
 
 
 @router.post("")
 async def send_chat_message(body: ChatMessageBody, user_id: str = Depends(get_current_user_id)):
-    db = get_db()
+    db = await get_user_db(user_id)
     now = datetime.now(timezone.utc)
     text = body.message.strip()
 
@@ -75,9 +75,16 @@ async def send_chat_message(body: ChatMessageBody, user_id: str = Depends(get_cu
         inserted = await db.job_requests.insert_one(job_doc)
         job_request_id = str(inserted.inserted_id)
 
+        core_db = get_core_db()
+        await core_db.settings.update_one({"user_id": user_id}, {"$inc": {"applications_count": 1}}, upsert=True)
+
     reply_now = datetime.now(timezone.utc)
     assistant_msg = {"user_id": user_id, "role": "assistant", "content": result["reply"], "created_at": reply_now}
     await db.chat_messages.insert_one(assistant_msg)
+
+    # Account-level usage counter (numbers only) lives in the hosted core DB.
+    core_db = get_core_db()
+    await core_db.settings.update_one({"user_id": user_id}, {"$inc": {"chats_count": 1}}, upsert=True)
 
     return {
         "reply": result["reply"],
