@@ -1,0 +1,301 @@
+"""
+ai_brain.py — Part B "brain" module.
+
+Builds the AI prompt from a user's profile + a batch of unanswered form
+fields, dispatches to the resolved provider (shared platform key when
+ai_provider="ours", else the user's own decrypted key), and streams
+completed {index, value} answers out as soon as each one is parseable
+from the partial response — without waiting for the full JSON to close.
+
+Kept separate from ws.py so the WebSocket route stays focused on
+connection lifecycle, not prompt/provider logic.
+
+LIMITATION (real, not hypothetical): profile.py only stores a freeform
+about_paragraph plus a list of uploaded documents (file path or link) —
+nothing extracts text from an uploaded resume PDF. So the AI only ever
+sees the about_paragraph and document titles/links, not actual resume
+content. If a field needs specifics only present in a resume file (e.g.
+"years at your last company"), the AI will do its best from
+about_paragraph alone and may return an empty/low-confidence answer.
+Document text extraction is a separate, later piece of work.
+"""
+
+import json
+from collections.abc import AsyncIterator
+
+import httpx
+
+from app.core.config import settings as app_settings
+from app.core.db import get_db
+from app.core.field_encryption import decrypt_secret
+
+AI_TIMEOUT_SECONDS = 20
+
+# Types the fill loop already treats specially — these should never be sent
+# to the AI for a text answer (checkboxes/radios need true/false semantics
+# select needs one of its real option values; automation.js's existing fill
+# loop already skips 'select' entirely, so we don't answer those either).
+SKIP_FIELD_TYPES = {"checkbox", "radio", "submit", "button", "file"}
+
+
+def _filterable_fields(fields: list[dict]) -> list[dict]:
+    """Drop fields that already have a value, or types the AI shouldn't
+    answer (matches automation.js's own skip logic so we don't waste a
+    token generating an answer that'll never be used)."""
+    out = []
+    for f in fields:
+        if f.get("currentValue", "").strip():
+            continue
+        if f.get("type") in SKIP_FIELD_TYPES:
+            continue
+        out.append(f)
+    return out
+
+
+async def _load_profile_context(user_id: str) -> dict:
+    """Loaded once per session by the caller (ws.py) and reused across
+    re-scans within that same /ws/bot connection — this function itself
+    is just the DB read; caching is the caller's job."""
+    db = get_db()
+    profile = await db.profiles.find_one({"user_id": user_id}) or {}
+    documents = await db.documents.find({"user_id": user_id}).sort("created_at", -1).to_list(length=50)
+    return {
+        "about_paragraph": profile.get("about_paragraph", ""),
+        "documents": [{"title": d.get("title"), "type": d.get("type"), "url": d.get("url")} for d in documents],
+    }
+
+
+async def _resolve_provider_and_key(user_id: str) -> tuple[str, str]:
+    db = get_db()
+    doc = await db.settings.find_one({"user_id": user_id}) or {}
+    provider = doc.get("ai_provider", app_settings.default_ai_provider)
+
+    if provider == "ours" or not doc.get("ai_api_key"):
+        # Shared platform key for the given provider, defaulting to anthropic.
+        key_map = {
+            "openai": app_settings.openai_api_key,
+            "groq": app_settings.groq_api_key,
+            "anthropic": app_settings.anthropic_api_key,
+        }
+        return "anthropic", app_settings.anthropic_api_key if provider == "ours" else key_map.get(provider, "")
+
+    decrypted = decrypt_secret(doc["ai_api_key"])
+    if decrypted is None:
+        # Corrupt/undecryptable key (e.g. FIELD_ENCRYPTION_KEY rotated) — fall
+        # back to the shared key rather than hard-failing the whole scan.
+        return "anthropic", app_settings.anthropic_api_key
+    return provider, decrypted
+
+
+def _build_prompt(fields: list[dict], profile: dict) -> str:
+    field_lines = []
+    for f in fields:
+        field_lines.append(
+            f'- index={f["index"]}, type="{f.get("type") or f.get("tag")}", '
+            f'question="{f.get("question") or "(no visible label)"}", required={f.get("required", False)}'
+        )
+
+    doc_lines = "\n".join(f'- {d["title"]} ({d["type"]}): {d["url"]}' for d in profile["documents"]) or "(none)"
+
+    return f"""You are filling out a job application form on behalf of a candidate.
+Use ONLY the candidate information below — do not invent facts, employers, or dates not present here.
+
+CANDIDATE ABOUT:
+{profile["about_paragraph"] or "(not provided)"}
+
+CANDIDATE DOCUMENTS:
+{doc_lines}
+
+FORM FIELDS TO ANSWER:
+{chr(10).join(field_lines)}
+
+Respond with ONLY a JSON object mapping each field's index (as a string) to its answer value.
+Match the value's type to the field: plain strings for text/textarea/email/tel/number fields.
+If you don't have enough information to answer a field confidently, use an empty string "" for it
+rather than guessing — an empty answer is skipped safely, a wrong guess is not.
+Return JSON only, no other text, no markdown code fences.
+Example shape: {{"0": "Jane Doe", "1": "jane@example.com", "2": ""}}"""
+
+
+async def stream_answers(user_id: str, fields: list[dict], profile: dict) -> AsyncIterator[tuple[int, str]]:
+    """
+    Yields (field_index, value) tuples as soon as each is parseable from the
+    AI's streamed output — the caller (ws.py) pushes each one over the
+    socket immediately rather than waiting for generation to finish.
+    """
+    filtered = _filterable_fields(fields)
+    if not filtered:
+        return
+
+    provider, api_key = await _resolve_provider_and_key(user_id)
+    if not api_key:
+        # No usable key for this provider — nothing to do; caller will still
+        # send answers_complete with zero chunks, which is a safe no-op.
+        return
+
+    prompt = _build_prompt(filtered, profile)
+    already_yielded: set[int] = set()
+
+    async for partial_text in _stream_provider(provider, api_key, prompt):
+        # Attempt to parse whatever complete key/value pairs exist so far in
+        # the accumulating text, even though the overall JSON object isn't
+        # closed yet. This is a best-effort incremental parse, not a strict
+        # streaming JSON parser — good enough for a flat {index: value} shape.
+        for index, value in _extract_complete_pairs(partial_text, already_yielded):
+            already_yielded.add(index)
+            yield index, value
+
+    # Catch anything left over once the stream fully closes (in case the
+    # incremental parser missed the last pair before the closing brace).
+    try:
+        final_obj = json.loads(partial_text)
+        for k, v in final_obj.items():
+            idx = int(k)
+            if idx not in already_yielded:
+                yield idx, str(v)
+    except (json.JSONDecodeError, NameError):
+        pass
+
+
+def _extract_complete_pairs(partial_text: str, already_yielded: set[int]) -> list[tuple[int, str]]:
+    """
+    Best-effort scan for complete "index": "value" pairs inside a still-
+    growing JSON object string. Only returns pairs whose closing quote (or
+    closing brace, for the last one) has definitely been seen — never
+    guesses at a value that might still be mid-generation.
+    """
+    results = []
+    depth = 0
+    i = 0
+    n = len(partial_text)
+    while i < n:
+        if partial_text[i] == "{":
+            depth += 1
+        elif partial_text[i] == "}":
+            depth -= 1
+        i += 1
+
+    # Simple regex-free scan: find `"digits"` followed by `:` followed by a
+    # quoted string that is fully closed (an even, non-escaped closing quote).
+    import re
+
+    for match in re.finditer(r'"(\d+)"\s*:\s*"((?:[^"\\]|\\.)*)"\s*[,}]', partial_text):
+        idx = int(match.group(1))
+        if idx in already_yielded:
+            continue
+        value = match.group(2).replace('\\"', '"').replace("\\\\", "\\")
+        results.append((idx, value))
+    return results
+
+
+async def _stream_provider(provider: str, api_key: str, prompt: str) -> AsyncIterator[str]:
+    """
+    Yields the accumulating text output as it streams in from the given
+    provider. Each yield is the FULL text so far (not a delta) so the
+    incremental parser above can just re-scan the whole thing each time —
+    simpler and safe for a JSON object that's still growing.
+    """
+    if provider == "anthropic":
+        async for chunk in _stream_anthropic(api_key, prompt):
+            yield chunk
+    elif provider == "openai":
+        async for chunk in _stream_openai(api_key, prompt):
+            yield chunk
+    elif provider == "groq":
+        async for chunk in _stream_groq(api_key, prompt):
+            yield chunk
+    else:
+        return
+
+
+async def _stream_anthropic(api_key: str, prompt: str) -> AsyncIterator[str]:
+    accumulated = ""
+    async with httpx.AsyncClient(timeout=AI_TIMEOUT_SECONDS) as client:
+        async with client.stream(
+            "POST",
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 2000,
+                "stream": True,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        ) as response:
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data = line[len("data: "):]
+                if data == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "content_block_delta":
+                    delta = event.get("delta", {}).get("text", "")
+                    accumulated += delta
+                    yield accumulated
+
+
+async def _stream_openai(api_key: str, prompt: str) -> AsyncIterator[str]:
+    accumulated = ""
+    async with httpx.AsyncClient(timeout=AI_TIMEOUT_SECONDS) as client:
+        async with client.stream(
+            "POST",
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "content-type": "application/json"},
+            json={
+                "model": "gpt-4o-mini",
+                "stream": True,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        ) as response:
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data = line[len("data: "):]
+                if data == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                delta = event.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                if delta:
+                    accumulated += delta
+                    yield accumulated
+
+
+async def _stream_groq(api_key: str, prompt: str) -> AsyncIterator[str]:
+    # Groq's API is OpenAI-compatible.
+    accumulated = ""
+    async with httpx.AsyncClient(timeout=AI_TIMEOUT_SECONDS) as client:
+        async with client.stream(
+            "POST",
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "content-type": "application/json"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "stream": True,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        ) as response:
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data = line[len("data: "):]
+                if data == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                delta = event.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                if delta:
+                    accumulated += delta
+                    yield accumulated
