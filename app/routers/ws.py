@@ -6,7 +6,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.core.db import get_core_db, get_user_db
 from app.core.security import decode_access_token, verify_bot_token
-from app.services import ai_brain, agent_brain
+from app.services import ai_brain, agent_brain, session_manager, site_catalog
 
 router = APIRouter(tags=["ws"])
 
@@ -42,6 +42,9 @@ class ConnectionManager:
         update matching one of DashboardSocket's EVENT_TYPES:
         bot_status | job_progress_update | hr_contact_added |
         daily_counter_update | application_reply_received
+        Also used, with kind="bot", to send navigation commands down to the
+        bot itself (open_site, apply_filters, resume_session, etc.) — same
+        delivery mechanism, different audience.
         """
         conns = self._connections[kind].get(user_id, set())
         message = json.dumps({"type": event_type, "payload": payload})
@@ -59,6 +62,74 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
+
+
+async def start_automation_session(
+    user_id: str, job_request_id: str, job_type: str, experience_level: str, target_sites: list[str]
+) -> bool:
+    """
+    Entry point called from jobs.py (POST /jobs/request) and chat.py (a
+    job_search intent from the AI chat) right after a job_requests document
+    is written. This is what turns "user asked for jobs" into the bot
+    actually opening a browser tab — without this, a queued job_requests
+    row just sat there with nothing consuming it (the old worker-based
+    /internal/* path was never actually built).
+
+    Returns False (and does nothing else) if the bot isn't currently
+    connected — the job_requests document still exists with status
+    "queued", so nothing is lost; the next time the bot comes online it
+    won't auto-pick this up (that cross-session "resume a never-started
+    request" queue-drain is a separate, later piece — this covers the
+    "bot already open" case, which is the common one).
+    """
+    if not manager.is_bot_online(user_id) or not target_sites:
+        return False
+
+    session = await session_manager.start_session(
+        user_id, job_request_id, job_type, experience_level, target_sites
+    )
+    await _open_site_for_session(user_id, session)
+    return True
+
+
+async def _open_site_for_session(user_id: str, session: dict) -> None:
+    """Builds the concrete search URL for the site at the session's current
+    site_index and sends open_site to the bot. Shared by both the initial
+    kickoff and handle_no_more_jobs (after a site's jobs are exhausted)."""
+    site_index = session["site_index"]
+    target_sites = session["target_sites"]
+    session_id = str(session["_id"])
+
+    if site_index >= len(target_sites):
+        await session_manager.complete_session(user_id, session_id)
+        await manager.send_to_user(user_id, "session_complete", {"session_id": session_id}, kind="bot")
+        await manager.send_to_user(
+            user_id,
+            "daily_counter_update",
+            {"jobs_applied": session["jobs_applied"], "jobs_skipped": session["jobs_skipped"]},
+            kind="dashboard",
+        )
+        return
+
+    site_name = target_sites[site_index]
+    built = site_catalog.build_search_url(site_name, session["job_type"], session["experience_level"])
+
+    await session_manager.update_session(
+        user_id, session_id, step="opening_site", current_url=built["url"]
+    )
+    await manager.send_to_user(
+        user_id,
+        "open_site",
+        {
+            "session_id": session_id,
+            "site": site_name,
+            "url": built["url"],
+            "needs_ui_filters": built["needs_ui_filters"],
+            "job_type": session["job_type"],
+            "experience_level": session["experience_level"],
+        },
+        kind="bot",
+    )
 
 
 @router.websocket("/ws/dashboard")
@@ -153,6 +224,35 @@ async def bot_ws(websocket: WebSocket):
     # re-scans) so we don't re-hit Mongo for profile/documents every time.
     profile_cache: dict | None = None
 
+    # RECOVERY: if this user had a session mid-flight when they last
+    # disconnected (internet drop, bot restart, laptop closed), it's sitting
+    # in Mongo as status "in_progress" or "interrupted". Hand it back to the
+    # bot immediately on reconnect instead of silently losing that progress
+    # — the bot decides how to act on resume_session (e.g. reopen
+    # current_url and pick back up at `step`), but the backend is the one
+    # telling it that unfinished work exists at all.
+    resumable = await session_manager.get_resumable_session(user_id)
+    if resumable is not None:
+        session_id = str(resumable["_id"])
+        await session_manager.update_session(user_id, session_id, status="in_progress")
+        await manager.send_to_user(
+            user_id,
+            "resume_session",
+            {
+                "session_id": session_id,
+                "step": resumable.get("step"),
+                "current_url": resumable.get("current_url"),
+                "current_job": resumable.get("current_job"),
+                "job_type": resumable.get("job_type"),
+                "experience_level": resumable.get("experience_level"),
+                "target_sites": resumable.get("target_sites"),
+                "site_index": resumable.get("site_index", 0),
+                "jobs_applied": resumable.get("jobs_applied", 0),
+                "jobs_skipped": resumable.get("jobs_skipped", 0),
+            },
+            kind="bot",
+        )
+
     async def heartbeat():
         nonlocal last_pong
         while True:
@@ -170,6 +270,63 @@ async def bot_ws(websocket: WebSocket):
 
     hb_task = asyncio.create_task(heartbeat())
 
+    async def handle_open_site_ack(payload: dict):
+        """
+        Bot confirms the search-results page actually loaded (and, if the
+        bot handles login itself, that it's logged in). If this site needs
+        UI-based filters (see site_catalog.NEEDS_UI_FILTERS — no clean URL
+        param for experience level), the backend now tells the bot exactly
+        what filter to apply next; otherwise the URL already encoded the
+        filter and the bot goes straight to scanning listings.
+        """
+        session_id = payload.get("session_id")
+        needs_ui_filters = payload.get("needs_ui_filters", False)
+        if not session_id:
+            return
+
+        if needs_ui_filters:
+            await session_manager.update_session(user_id, session_id, step="awaiting_filters")
+            await manager.send_to_user(
+                user_id,
+                "apply_filters",
+                {"session_id": session_id, "experience_level": payload.get("experience_level")},
+                kind="bot",
+            )
+        else:
+            await session_manager.update_session(user_id, session_id, step="scanning")
+
+    async def handle_filters_applied(payload: dict):
+        """Bot confirms it clicked through the on-page filter UI. Either
+        way (URL-param site or UI-filter site) the session converges here:
+        scanning listings is the next step."""
+        session_id = payload.get("session_id")
+        if session_id:
+            await session_manager.update_session(user_id, session_id, step="scanning")
+
+    async def handle_no_more_jobs(payload: dict):
+        """
+        Bot reports it reached the end of this site's listings (no more
+        results, or hit the daily/session limit). Backend advances to the
+        next target site, or completes the session if that was the last
+        one — the bot never has to know how many sites are left or decide
+        what "next" means, it just keeps telling the backend what happened
+        and waiting for the next instruction.
+        """
+        session_id = payload.get("session_id")
+        if not session_id:
+            return
+        db = await get_user_db(user_id)
+        from bson import ObjectId
+
+        session = await db.automation_sessions.find_one({"_id": ObjectId(session_id)})
+        if session is None:
+            return
+        await session_manager.update_session(
+            user_id, session_id, site_index=session["site_index"] + 1, step="opening_site"
+        )
+        session["site_index"] += 1
+        await _open_site_for_session(user_id, session)
+
     async def handle_scan_fields(payload: dict):
         nonlocal profile_cache
         session_id = payload.get("session_id")
@@ -177,6 +334,9 @@ async def bot_ws(websocket: WebSocket):
 
         if profile_cache is None:
             profile_cache = await ai_brain._load_profile_context(user_id)
+
+        if session_id:
+            await session_manager.update_session(user_id, session_id, step="filling")
 
         async def run_stream():
             try:
@@ -212,15 +372,21 @@ async def bot_ws(websocket: WebSocket):
         replaces that REST+shared-secret path for bot traffic, per the
         architecture decision to route all bot-originated events through
         /ws/bot instead.
+
+        Also bumps the owning automation_session's counters (if this report
+        belongs to one) so dashboard/session recovery has an accurate
+        applied/skipped count without re-deriving it from job_applications
+        every time.
         """
         db = await get_user_db(user_id)
         now = datetime.now(timezone.utc)
+        status_value = payload.get("status", "pending")
         doc = {
             "user_id": user_id,
             "role": payload.get("role_title") or "Unknown",
             "company": payload.get("company_name") or "Unknown",
             "site": payload.get("source_site_url") or payload.get("job_url") or "",
-            "status": payload.get("status", "pending"),
+            "status": status_value,
             "link": payload.get("job_url"),
             "reply_received": False,
             "reply_snippet": None,
@@ -228,6 +394,12 @@ async def bot_ws(websocket: WebSocket):
         }
         result = await db.job_applications.insert_one(doc)
         doc_id = str(result.inserted_id)
+
+        session_id = payload.get("session_id")
+        if session_id:
+            counter_field = "jobs_applied" if status_value == "submitted" else "jobs_skipped"
+            await session_manager.increment_counter(user_id, session_id, counter_field)
+            await session_manager.update_session(user_id, session_id, step="scanning", current_job=None)
 
         await manager.send_to_user(
             user_id,
@@ -259,9 +431,15 @@ async def bot_ws(websocket: WebSocket):
         nonlocal profile_cache
         job = payload.get("job", {})
         request_id = payload.get("request_id")
+        session_id = payload.get("session_id")
 
         if profile_cache is None:
             profile_cache = await ai_brain._load_profile_context(user_id)
+
+        if session_id:
+            await session_manager.update_session(
+                user_id, session_id, step="awaiting_decision", current_job=job
+            )
 
         existing = await agent_brain.already_decided(user_id, job)
         if existing is not None:
@@ -296,12 +474,23 @@ async def bot_ws(websocket: WebSocket):
                 await handle_scan_fields(msg.get("payload", msg))
             elif msg_type == "report_result":
                 await handle_report_result(msg.get("payload", msg))
+            elif msg_type == "site_opened":
+                await handle_open_site_ack(msg.get("payload", msg))
+            elif msg_type == "filters_applied":
+                await handle_filters_applied(msg.get("payload", msg))
+            elif msg_type == "no_more_jobs":
+                await handle_no_more_jobs(msg.get("payload", msg))
     except WebSocketDisconnect:
         pass
     finally:
         hb_task.cancel()
         manager.disconnect("bot", user_id, websocket)
         now = await _mark_bot_status(user_id, online=False)
+        # Don't let a live automation session sit stamped "in_progress"
+        # forever with nobody actually running it — flag it interrupted so
+        # get_resumable_session() picks it up the next time this user's bot
+        # connects, instead of it looking active-but-dead indefinitely.
+        await session_manager.mark_interrupted(user_id)
         await manager.send_to_user(
             user_id, "bot_status", {"online": False, "last_seen": now.isoformat()}, kind="dashboard"
         )
