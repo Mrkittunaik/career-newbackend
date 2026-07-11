@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 
-from app.core.db import get_db
+from app.core.db import get_user_db, get_core_db
 from app.core.security import get_current_user_id
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -33,7 +33,7 @@ def _serialize_application(app: dict) -> dict:
 
 @router.post("/request", status_code=201)
 async def submit_job_request(body: JobRequestBody, user_id: str = Depends(get_current_user_id)):
-    db = get_db()
+    db = await get_user_db(user_id)
     doc = {
         "user_id": user_id,
         "job_type": body.job_type,
@@ -46,6 +46,12 @@ async def submit_job_request(body: JobRequestBody, user_id: str = Depends(get_cu
     # NOTE: the actual scanning/auto-apply bot is a separate worker process that should
     # watch the `job_requests` collection (status == "queued") and write results into
     # `job_applications` + push WebSocket events. This endpoint only enqueues the request.
+
+    # Account-level usage counter (numbers only) lives in the hosted core DB
+    # regardless of storage_mode — see db.py's split rationale.
+    core_db = get_core_db()
+    await core_db.settings.update_one({"user_id": user_id}, {"$inc": {"applications_count": 1}}, upsert=True)
+
     return {"id": str(result.inserted_id), "status": "queued"}
 
 
@@ -55,7 +61,7 @@ async def get_job_applications(
     search: str | None = Query(default=None),
     user_id: str = Depends(get_current_user_id),
 ):
-    db = get_db()
+    db = await get_user_db(user_id)
     query: dict = {"user_id": user_id}
     if status_ and status_ != "all":
         query["status"] = status_
@@ -71,7 +77,7 @@ async def get_job_applications(
 
 @router.get("/limit")
 async def get_daily_limit(user_id: str = Depends(get_current_user_id)):
-    db = get_db()
+    db = await get_user_db(user_id)
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     applied_today = await db.job_applications.count_documents(
         {"user_id": user_id, "status": "submitted", "applied_at": {"$gte": today_start}}
