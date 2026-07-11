@@ -26,7 +26,7 @@ from collections.abc import AsyncIterator
 import httpx
 
 from app.core.config import settings as app_settings
-from app.core.db import get_db
+from app.core.db import get_core_db, get_user_db
 from app.core.field_encryption import decrypt_secret
 
 AI_TIMEOUT_SECONDS = 20
@@ -56,7 +56,7 @@ async def _load_profile_context(user_id: str) -> dict:
     """Loaded once per session by the caller (ws.py) and reused across
     re-scans within that same /ws/bot connection — this function itself
     is just the DB read; caching is the caller's job."""
-    db = get_db()
+    db = await get_user_db(user_id)
     profile = await db.profiles.find_one({"user_id": user_id}) or {}
     documents = await db.documents.find({"user_id": user_id}).sort("created_at", -1).to_list(length=50)
     return {
@@ -66,7 +66,10 @@ async def _load_profile_context(user_id: str) -> dict:
 
 
 async def _resolve_provider_and_key(user_id: str) -> tuple[str, str]:
-    db = get_db()
+    # ai_provider/ai_api_key are account-level settings, always in the
+    # hosted core DB regardless of the user's storage_mode for job/chat
+    # content — see app/core/db.py's split rationale.
+    db = get_core_db()
     doc = await db.settings.find_one({"user_id": user_id}) or {}
     provider = doc.get("ai_provider", app_settings.default_ai_provider)
 
