@@ -2,6 +2,21 @@
 Internal-only endpoints used by the worker process (worker.py), never called
 by the frontend. Protected by a shared secret (INTERNAL_API_SECRET), not by
 user JWTs, since the worker acts on behalf of many users at once.
+
+ARCHITECTURE NOTE — per-user database isolation:
+Each account is fully isolated based on that user's own storage_mode choice
+(see app/core/db.py get_user_db). A user on storage_mode="own" has ALL of
+their content — profile, documents, job_requests, job_applications,
+job_decisions, hr_contacts, chat_messages — in their own MongoDB, not
+split across collections. This means the endpoints below that scan across
+ALL users (claim_next_job_request, list_queued_job_requests) currently only
+see requests sitting in the HOSTED database. A future worker that wants to
+service "own" users too will need to additionally loop over every user with
+storage_mode="own" and check their individual database's job_requests
+collection — there is no single cross-account query possible once accounts
+are on separate databases, by design (that's what isolation means). This
+file is not yet wired to do that multi-database scan; it's a known gap to
+close when the worker process is actually built.
 """
 
 from datetime import datetime, timezone
@@ -10,7 +25,7 @@ from fastapi import APIRouter, Header, HTTPException, status
 from pydantic import BaseModel
 
 from app.core.config import settings
-from app.core.db import get_db
+from app.core.db import get_core_db, get_user_db
 from app.routers.ws import manager
 
 router = APIRouter(prefix="/internal", tags=["internal"])
@@ -53,9 +68,13 @@ class PushEventBody(BaseModel):
 
 @router.post("/job-requests/{request_id}/claim")
 async def claim_next_job_request(request_id: str, x_internal_secret: str | None = Header(default=None)):
-    """Worker polls this to atomically grab the next queued job request."""
+    """
+    Worker polls this to atomically grab the next queued job request.
+    NOTE: only scans the hosted DB — see the module docstring above on why
+    a single query can't also reach "own"-storage users' separate databases.
+    """
     _check_secret(x_internal_secret)
-    db = get_db()
+    db = get_core_db()
     from bson import ObjectId
 
     doc = await db.job_requests.find_one_and_update(
@@ -70,8 +89,9 @@ async def claim_next_job_request(request_id: str, x_internal_secret: str | None 
 
 @router.get("/job-requests/queued")
 async def list_queued_job_requests(x_internal_secret: str | None = Header(default=None)):
+    """NOTE: hosted DB only — see module docstring."""
     _check_secret(x_internal_secret)
-    db = get_db()
+    db = get_core_db()
     docs = await db.job_requests.find({"status": "queued"}).to_list(length=100)
     for d in docs:
         d["_id"] = str(d["_id"])
@@ -80,8 +100,9 @@ async def list_queued_job_requests(x_internal_secret: str | None = Header(defaul
 
 @router.post("/job-requests/{request_id}/complete")
 async def complete_job_request(request_id: str, x_internal_secret: str | None = Header(default=None)):
+    """NOTE: hosted DB only — see module docstring."""
     _check_secret(x_internal_secret)
-    db = get_db()
+    db = get_core_db()
     from bson import ObjectId
 
     await db.job_requests.update_one(
@@ -94,7 +115,7 @@ async def complete_job_request(request_id: str, x_internal_secret: str | None = 
 @router.post("/applications")
 async def upsert_application(body: ApplicationUpsert, x_internal_secret: str | None = Header(default=None)):
     _check_secret(x_internal_secret)
-    db = get_db()
+    db = await get_user_db(body.user_id)
     doc = {
         "user_id": body.user_id,
         "role": body.role,
@@ -129,7 +150,7 @@ async def upsert_application(body: ApplicationUpsert, x_internal_secret: str | N
 @router.post("/hr-contacts")
 async def create_hr_contact(body: HrContactCreate, x_internal_secret: str | None = Header(default=None)):
     _check_secret(x_internal_secret)
-    db = get_db()
+    db = await get_user_db(body.user_id)
     doc = {
         "user_id": body.user_id,
         "name": body.name,
@@ -158,14 +179,17 @@ async def create_hr_contact(body: HrContactCreate, x_internal_secret: str | None
 @router.post("/bot-status")
 async def update_bot_status(body: BotStatusUpdate, x_internal_secret: str | None = Header(default=None)):
     _check_secret(x_internal_secret)
-    db = get_db()
+    # bot_sessions is per-user content -> user's own DB; bot_online is an
+    # account-level flag on settings -> always hosted core DB.
+    user_db = await get_user_db(body.user_id)
+    core_db = get_core_db()
     now = datetime.now(timezone.utc)
-    await db.bot_sessions.update_one(
+    await user_db.bot_sessions.update_one(
         {"user_id": body.user_id},
         {"$set": {"online": body.online, "last_seen": now}},
         upsert=True,
     )
-    await db.settings.update_one({"user_id": body.user_id}, {"$set": {"bot_online": body.online}}, upsert=True)
+    await core_db.settings.update_one({"user_id": body.user_id}, {"$set": {"bot_online": body.online}}, upsert=True)
 
     await manager.send_to_user(body.user_id, "bot_status", {"online": body.online, "last_seen": now.isoformat()})
     return {"ok": True}
