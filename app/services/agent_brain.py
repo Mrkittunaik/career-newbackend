@@ -192,3 +192,86 @@ async def already_decided(user_id: str, job: dict) -> dict | None:
         return None
     db = get_db()
     return await db.job_decisions.find_one({"user_id": user_id, "url": job_url})
+
+
+VALID_SITES = ["LinkedIn", "Indeed", "Glassdoor", "Naukri", "Monster", "ZipRecruiter", "Wellfound", "Dice", "SimplyHired"]
+
+
+def _build_chat_prompt(message: str, history: list[dict]) -> str:
+    history_lines = "\n".join(f'{h["role"]}: {h["content"]}' for h in history[-6:]) or "(no prior messages)"
+    return f"""You are the assistant inside CareerOS, a job-search automation product.
+The user is talking to you in a chat box. Your job is to read their message and decide:
+(a) are they asking you to start a job search / apply to jobs, or
+(b) are they just asking a question or chatting, with no job search to start.
+
+RECENT CONVERSATION:
+{history_lines}
+
+LATEST USER MESSAGE:
+{message}
+
+VALID TARGET SITES (only use these, spelled exactly): {", ".join(VALID_SITES)}
+
+If (a) — they want a job search started — extract:
+- job_type: the role/title they want (e.g. "Backend Engineer"). If not stated, use "".
+- experience_level: one of "fresher", "experienced", or "any". Infer from context if
+  not stated explicitly (e.g. "I'm a student" -> fresher). Default to "any" if unclear.
+- target_sites: array of site names from the VALID TARGET SITES list above that match
+  what they asked for. If they didn't name any, default to ["LinkedIn", "Indeed"].
+- reply: a short, friendly one-sentence confirmation of what you're about to do.
+
+If (b) — no job search intent — just extract:
+- reply: a short, helpful, friendly response as plain conversation. Do not invent
+  facts about the user's applications or account; if they're asking about status
+  info you don't have here, say you'll need to check the dashboard for that.
+
+Respond with ONLY a JSON object, no other text, no markdown fences:
+{{"intent": "job_search" or "chat", "job_type": "...", "experience_level": "...", "target_sites": [...], "reply": "..."}}
+For intent "chat", you may omit job_type/experience_level/target_sites entirely."""
+
+
+async def handle_chat_message(user_id: str, message: str, history: list[dict]) -> dict:
+    """
+    Parses a free-text chat message into either:
+      - a job search request (intent="job_search"), which the caller (chat.py)
+        turns into a real job_requests document — the same collection
+        submit_job_request() in jobs.py already writes to, so the existing
+        job-request pipeline (and eventually the bot/worker consuming it)
+        needs no changes to understand a chat-originated request.
+      - plain conversation (intent="chat"), just a reply with no side effect.
+
+    On any AI failure, falls back to intent="chat" with an apologetic reply —
+    a parsing failure should never silently queue a job search the user
+    didn't clearly ask for.
+    """
+    provider, api_key = await ai_brain._resolve_provider_and_key(user_id)
+    if not api_key:
+        return {
+            "intent": "chat",
+            "reply": "I don't have an AI provider configured yet — add one in Settings and I'll be able to help.",
+        }
+
+    prompt = _build_chat_prompt(message, history)
+    try:
+        raw = await _call_once(provider, api_key, prompt)
+        parsed = json.loads(raw)
+        intent = parsed.get("intent") if parsed.get("intent") in ("job_search", "chat") else "chat"
+        result = {"intent": intent, "reply": parsed.get("reply") or "Got it."}
+        if intent == "job_search":
+            sites = [s for s in parsed.get("target_sites", []) if s in VALID_SITES]
+            result["job_type"] = str(parsed.get("job_type") or "").strip()
+            result["experience_level"] = (
+                parsed.get("experience_level") if parsed.get("experience_level") in ("fresher", "experienced", "any") else "any"
+            )
+            result["target_sites"] = sites or ["LinkedIn", "Indeed"]
+            # A job search with no discernible role isn't actionable — fall back
+            # to chat so the user gets asked to clarify instead of a silently
+            # broken/empty job_requests entry being queued.
+            if not result["job_type"]:
+                return {
+                    "intent": "chat",
+                    "reply": "What kind of role are you looking for? (e.g. \"Backend Engineer\", \"Product Manager\")",
+                }
+        return result
+    except Exception:
+        return {"intent": "chat", "reply": "Sorry, I had trouble understanding that — could you rephrase?"}
