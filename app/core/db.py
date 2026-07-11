@@ -115,3 +115,5 @@ async def ensure_indexes():
     await db.job_requests.create_index("user_id")
     await db.job_decisions.create_index("user_id")
     await db.chat_messages.create_index([("user_id", 1), ("created_at", 1)])
+    await db.chat_messages.create_index([("conversation_id", 1), ("created_at", 1)])
+    await db.conversations.create_index([("user_id", 1), ("updated_at", -1)])
