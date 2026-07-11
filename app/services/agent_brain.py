@@ -200,15 +200,90 @@ async def already_decided(user_id: str, job: dict) -> dict | None:
     return await db.job_decisions.find_one({"user_id": user_id, "url": job_url})
 
 
+
 VALID_SITES = ["LinkedIn", "Indeed", "Glassdoor", "Naukri", "Monster", "ZipRecruiter", "Wellfound", "Dice", "SimplyHired"]
 
+# The four things the intake flow needs before it's allowed to ask "should I
+# start?". company_pref is intentionally not required — after a couple turns
+# with it still unknown, the AI is told to default it to "any" rather than
+# stall the whole flow over a preference the user may not have an opinion on.
+REQUIRED_INTAKE_FIELDS = ("role", "location", "experience_type", "target_sites")
 
-def _build_chat_prompt(message: str, history: list[dict]) -> str:
-    history_lines = "\n".join(f'{h["role"]}: {h["content"]}' for h in history[-6:]) or "(no prior messages)"
-    return f"""You are the assistant inside CareerOS, a job-search automation product.
-The user is talking to you in a chat box. Your job is to read their message and decide:
-(a) are they asking you to start a job search / apply to jobs, or
-(b) are they just asking a question or chatting, with no job search to start.
+EXPERIENCE_TYPE_TO_LEVEL = {
+    "internship": "fresher",
+    "fresher": "fresher",
+    "experienced": "experienced",
+}
+
+
+def _merge_intake(current: dict, extracted: dict) -> dict:
+    """New extracted values only overwrite current ones when they're
+    actually non-empty — a turn where the user only answered "Bangalore"
+    should never wipe out a role the user already gave two turns ago just
+    because this turn's extraction returned an empty string for it."""
+    merged = dict(current or {})
+    for key in ("role", "location", "experience_type", "company_pref"):
+        value = (extracted.get(key) or "").strip()
+        if value:
+            merged[key] = value
+    sites = extracted.get("target_sites")
+    if sites:
+        valid = [s for s in sites if s in VALID_SITES]
+        if valid:
+            merged["target_sites"] = valid
+    return merged
+
+
+def _intake_is_ready(intake: dict) -> bool:
+    if not intake.get("role") or not intake.get("location"):
+        return False
+    if not intake.get("experience_type"):
+        return False
+    if not intake.get("target_sites"):
+        return False
+    return True
+
+
+def _build_intake_prompt(message: str, history: list[dict], intake: dict, awaiting_confirmation: bool) -> str:
+    history_lines = "\n".join(f'{h["role"]}: {h["content"]}' for h in history[-8:]) or "(no prior messages)"
+
+    known_lines = "\n".join(
+        [
+            f"- role/title: {intake.get('role') or '(not yet known)'}",
+            f"- location: {intake.get('location') or '(not yet known)'}",
+            f"- experience_type: {intake.get('experience_type') or '(not yet known)'} (must be one of: internship, fresher, experienced)",
+            f"- company_pref: {intake.get('company_pref') or '(not yet known, optional)'} (one of: startup, top_company, any)",
+            f"- target_sites: {', '.join(intake.get('target_sites') or []) or '(not yet known)'}",
+        ]
+    )
+
+    if awaiting_confirmation:
+        confirmation_instructions = """
+The assistant already asked the user to confirm starting automation with the
+info above. The LATEST USER MESSAGE below is their answer to that question.
+- If it's an affirmative ("yes", "start", "go ahead", "do it", "sure", etc.) set
+  confirmed_start=true and reply with a short "Starting now..." style message.
+- If it's a decline or a request to change something ("no", "wait", "change the
+  role to X", etc.): set confirmed_start=false, update any field they asked to
+  change in "intake", and reply asking what they'd like to adjust (or just
+  acknowledge the cancellation if they said no with no changes).
+Never set confirmed_start=true unless the user's LATEST message is clearly a yes."""
+    else:
+        confirmation_instructions = """
+Not awaiting confirmation right now — this is a normal intake turn. Extract any
+new info the user just gave into "intake" (merge with what's already known,
+don't guess). If role, location, experience_type, and at least one target_site
+are ALL known after this turn, set ready=true and make "reply" a short summary
+of everything collected ending in a clear yes/no question: "Should I start
+applying now?". Otherwise set ready=false and make "reply" ONE short, friendly
+question asking for the single most important missing piece — ask in this
+priority order: role -> location -> experience_type -> target_sites ->
+company_pref. Never ask about more than one missing field in the same message."""
+
+    return f"""You are the job-search intake assistant inside CareerOS. Your job is to
+collect enough information before any automation starts, one question at a time —
+never dump multiple questions in one message, and never start automation without
+an explicit yes from the user.
 
 RECENT CONVERSATION:
 {history_lines}
@@ -216,68 +291,92 @@ RECENT CONVERSATION:
 LATEST USER MESSAGE:
 {message}
 
+INFO COLLECTED SO FAR:
+{known_lines}
+
 VALID TARGET SITES (only use these, spelled exactly): {", ".join(VALID_SITES)}
 
-If (a) — they want a job search started — extract:
-- job_type: the role/title they want (e.g. "Backend Engineer"). If not stated, use "".
-- experience_level: one of "fresher", "experienced", or "any". Infer from context if
-  not stated explicitly (e.g. "I'm a student" -> fresher). Default to "any" if unclear.
-- target_sites: array of site names from the VALID TARGET SITES list above that match
-  what they asked for. If they didn't name any, default to ["LinkedIn", "Indeed"].
-- reply: a short, friendly one-sentence confirmation of what you're about to do.
+{confirmation_instructions}
 
-If (b) — no job search intent — just extract:
-- reply: a short, helpful, friendly response as plain conversation. Do not invent
-  facts about the user's applications or account; if they're asking about status
-  info you don't have here, say you'll need to check the dashboard for that.
+If the latest message is unrelated to a job search (small talk, a question about
+the product, etc.) and no intake is in progress, just reply normally with
+ready=false, confirmed_start=false, and leave intake empty/unchanged.
 
 Respond with ONLY a JSON object, no other text, no markdown fences:
-{{"intent": "job_search" or "chat", "job_type": "...", "experience_level": "...", "target_sites": [...], "reply": "..."}}
-For intent "chat", you may omit job_type/experience_level/target_sites entirely."""
+{{"intake": {{"role": "...", "location": "...", "experience_type": "...", "company_pref": "...", "target_sites": [...]}}, "ready": true or false, "confirmed_start": true or false, "reply": "..."}}
+Omit or leave blank any intake field you don't have new info for."""
 
 
-async def handle_chat_message(user_id: str, message: str, history: list[dict]) -> dict:
+async def handle_chat_message(user_id: str, message: str, history: list[dict], intake_state: dict | None = None) -> dict:
     """
-    Parses a free-text chat message into either:
-      - a job search request (intent="job_search"), which the caller (chat.py)
-        turns into a real job_requests document — the same collection
-        submit_job_request() in jobs.py already writes to, so the existing
-        job-request pipeline (and eventually the bot/worker consuming it)
-        needs no changes to understand a chat-originated request.
-      - plain conversation (intent="chat"), just a reply with no side effect.
+    Multi-turn intake state machine, replacing the old one-shot "did they
+    ask for a job search" classifier. That old version could queue an
+    automation run off a single ambiguous sentence with no location,
+    experience level, or site chosen — this version always collects role,
+    location, experience_type (internship/fresher/experienced), and at
+    least one target site first, asking one short question per turn, and
+    then requires an explicit yes before intent becomes "job_search".
 
-    On any AI failure, falls back to intent="chat" with an apologetic reply —
-    a parsing failure should never silently queue a job search the user
-    didn't clearly ask for.
+    intake_state is the conversation's stored progress so far (see chat.py,
+    which persists this on the conversations document): {role, location,
+    experience_type, company_pref, target_sites, status}. status is one of
+    "collecting" | "awaiting_confirmation" | "confirmed".
+
+    Returns a dict always containing "intake" (the updated state to persist)
+    and "awaiting_confirmation" (bool), plus "intent" — only "job_search"
+    when the user just explicitly confirmed on this exact turn; "chat"
+    otherwise, even mid-intake (nothing gets queued to the bot until the
+    user says yes).
     """
     provider, api_key = await ai_brain._resolve_provider_and_key(user_id)
     if not api_key:
         return {
             "intent": "chat",
             "reply": "I don't have an AI provider configured yet — add one in Settings and I'll be able to help.",
+            "intake": intake_state or {},
+            "awaiting_confirmation": False,
         }
 
-    prompt = _build_chat_prompt(message, history)
+    intake_state = intake_state or {}
+    awaiting_confirmation = intake_state.get("status") == "awaiting_confirmation"
+
+    prompt = _build_intake_prompt(message, history, intake_state, awaiting_confirmation)
     try:
         raw = await _call_once(provider, api_key, prompt)
         parsed = json.loads(raw)
-        intent = parsed.get("intent") if parsed.get("intent") in ("job_search", "chat") else "chat"
-        result = {"intent": intent, "reply": parsed.get("reply") or "Got it."}
-        if intent == "job_search":
-            sites = [s for s in parsed.get("target_sites", []) if s in VALID_SITES]
-            result["job_type"] = str(parsed.get("job_type") or "").strip()
-            result["experience_level"] = (
-                parsed.get("experience_level") if parsed.get("experience_level") in ("fresher", "experienced", "any") else "any"
-            )
-            result["target_sites"] = sites or ["LinkedIn", "Indeed"]
-            # A job search with no discernible role isn't actionable — fall back
-            # to chat so the user gets asked to clarify instead of a silently
-            # broken/empty job_requests entry being queued.
-            if not result["job_type"]:
-                return {
-                    "intent": "chat",
-                    "reply": "What kind of role are you looking for? (e.g. \"Backend Engineer\", \"Product Manager\")",
-                }
-        return result
     except Exception:
-        return {"intent": "chat", "reply": "Sorry, I had trouble understanding that — could you rephrase?"}
+        return {
+            "intent": "chat",
+            "reply": "Sorry, I had trouble understanding that — could you rephrase?",
+            "intake": intake_state,
+            "awaiting_confirmation": awaiting_confirmation,
+        }
+
+    merged_intake = _merge_intake(intake_state, parsed.get("intake") or {})
+    reply = parsed.get("reply") or "Got it."
+    confirmed = bool(parsed.get("confirmed_start")) and awaiting_confirmation
+
+    if confirmed:
+        merged_intake["status"] = "confirmed"
+        experience_level = EXPERIENCE_TYPE_TO_LEVEL.get(merged_intake.get("experience_type"), "any")
+        return {
+            "intent": "job_search",
+            "reply": reply,
+            "intake": merged_intake,
+            "awaiting_confirmation": False,
+            "job_type": merged_intake.get("role") or "",
+            "experience_level": experience_level,
+            "target_sites": merged_intake.get("target_sites") or ["LinkedIn", "Indeed"],
+            "location": merged_intake.get("location"),
+            "company_pref": merged_intake.get("company_pref") or "any",
+        }
+
+    ready = bool(parsed.get("ready")) or _intake_is_ready(merged_intake)
+    merged_intake["status"] = "awaiting_confirmation" if ready else "collecting"
+
+    return {
+        "intent": "chat",
+        "reply": reply,
+        "intake": merged_intake,
+        "awaiting_confirmation": ready,
+    }
