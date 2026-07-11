@@ -90,9 +90,12 @@ async def _resolve_provider_and_key(user_id: str) -> tuple[str, str]:
 def _build_prompt(fields: list[dict], profile: dict) -> str:
     field_lines = []
     for f in fields:
+        options = f.get("options")
+        options_str = f" options={options}" if options else ""
         field_lines.append(
             f'- index={f["index"]}, type="{f.get("type") or f.get("tag")}", '
-            f'question="{f.get("question") or "(no visible label)"}", required={f.get("required", False)}'
+            f'question="{f.get("question") or "(no visible label)"}", '
+            f"required={f.get('required', False)}{options_str}"
         )
 
     doc_lines = "\n".join(f'- {d["title"]} ({d["type"]}): {d["url"]}' for d in profile["documents"]) or "(none)"
@@ -109,12 +112,25 @@ CANDIDATE DOCUMENTS:
 FORM FIELDS TO ANSWER:
 {chr(10).join(field_lines)}
 
+OUTPUT RULES (strict - a wrong format breaks the auto-fill):
+1. Return the RAW VALUE ONLY. Never wrap it in a sentence.
+   - Field asking for a name -> "Kittu", NOT "My name is Kittu".
+   - Field asking for a city -> "Hyderabad", NOT "I live in Hyderabad".
+   - Field asking for years of experience -> "3", NOT "I have 3 years of experience".
+2. If the question is yes/no in nature, answer with exactly "Yes" or "No" - nothing else.
+3. If the field lists options, your answer MUST be copied EXACTLY (character for
+   character) from one of those listed options. Never invent a value not in the list.
+4. For email/phone/number fields, return only the plain value - no labels, no extra words.
+5. Free-text questions (e.g. "Why do you want this role?") may be a short natural
+   sentence or two, based only on the candidate info above - this is the one
+   exception to rule 1.
+6. If you don't have enough information to answer a field confidently, use an
+   empty string "" rather than guessing - an empty answer is skipped safely,
+   a wrong guess is not.
+
 Respond with ONLY a JSON object mapping each field's index (as a string) to its answer value.
-Match the value's type to the field: plain strings for text/textarea/email/tel/number fields.
-If you don't have enough information to answer a field confidently, use an empty string "" for it
-rather than guessing — an empty answer is skipped safely, a wrong guess is not.
-Return JSON only, no other text, no markdown code fences.
-Example shape: {{"0": "Jane Doe", "1": "jane@example.com", "2": ""}}"""
+Return JSON only, no other text, no markdown code fences, no explanation.
+Example shape: {{"0": "Kittu", "1": "kittu@example.com", "2": "Yes", "3": ""}}"""
 
 
 async def stream_answers(user_id: str, fields: list[dict], profile: dict) -> AsyncIterator[tuple[int, str]]:
