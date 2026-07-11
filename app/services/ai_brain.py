@@ -273,6 +273,14 @@ async def _stream_openai(api_key: str, prompt: str) -> AsyncIterator[str]:
 
 async def _stream_groq(api_key: str, prompt: str) -> AsyncIterator[str]:
     # Groq's API is OpenAI-compatible.
+    # Using llama-3.1-8b-instant instead of llama-3.3-70b-versatile: same Groq
+    # key, but the free-tier daily cap is 14,400 requests/day on the 8b model
+    # vs only 1,000/day on the 70b model (per Groq's published rate limits,
+    # https://console.groq.com/docs/rate-limits). Since Groq's limits are
+    # per-organization (shared across every "ours" platform-key user, not
+    # per-user), the 8b model gives ~14x more headroom before the shared pool
+    # runs out for the day. Quality is somewhat lower than 70b, but adequate
+    # for structured form-field answers extracted from profile data.
     accumulated = ""
     async with httpx.AsyncClient(timeout=AI_TIMEOUT_SECONDS) as client:
         async with client.stream(
@@ -280,7 +288,7 @@ async def _stream_groq(api_key: str, prompt: str) -> AsyncIterator[str]:
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "content-type": "application/json"},
             json={
-                "model": "llama-3.3-70b-versatile",
+                "model": "llama-3.1-8b-instant",
                 "stream": True,
                 "messages": [{"role": "user", "content": prompt}],
             },
