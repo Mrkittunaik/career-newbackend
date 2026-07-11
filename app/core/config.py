@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     anthropic_api_key: str = ""
 
+    # Fernet key used to encrypt user-supplied AI API keys at rest (settings.ai_api_key).
+    # Generate with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    field_encryption_key: str = ""
+
     # Shared secret the worker process uses to call internal endpoints
     # (push websocket events, write scan results). Not exposed to the frontend.
     internal_api_secret: str = "insecure-dev-internal-secret-change-me"
