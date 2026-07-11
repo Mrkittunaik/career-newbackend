@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, EmailStr
 
 from app.core.config import settings
-from app.core.db import get_db
+from app.core.db import get_core_db
 from app.core.security import create_access_token, hash_password, verify_password
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -20,7 +20,14 @@ class GoogleLoginBody(BaseModel):
 
 
 async def _create_default_docs_for_user(db, user_id: str):
-    """Seeds an empty profile + settings row so downstream GETs don't 404."""
+    """
+    Seeds an empty profile + settings row so downstream GETs don't 404.
+    Written to the hosted (core) DB — a brand-new user hasn't chosen a
+    storage_mode yet, so "hosted" is correct by definition at this point;
+    once they switch to storage_mode="own" in Settings, subsequent
+    profile/job/chat writes route to their own DB via get_user_db(), but
+    this very first seed always belongs on the hosted side.
+    """
     await db.profiles.insert_one(
         {"user_id": user_id, "about_paragraph": "", "created_at": datetime.now(timezone.utc)}
     )
@@ -30,19 +37,23 @@ async def _create_default_docs_for_user(db, user_id: str):
             "bot_online": False,
             "bot_token_hash": None,
             "storage_mode": "hosted",
-            "mongo_url": None,
+            "mongo_url_encrypted": None,
             "ai_provider": settings.default_ai_provider,
             "ai_api_key": None,
             "gmail_connected": False,
             "gmail_email": None,
             "gmail_last_checked": None,
+            # Account-level usage counters — numbers only, live here in the
+            # hosted DB regardless of storage_mode (see db.py's split).
+            "applications_count": 0,
+            "chats_count": 0,
         }
     )
 
 
 @router.post("/signup")
 async def signup(body: EmailPasswordBody):
-    db = get_db()
+    db = get_core_db()
     existing = await db.users.find_one({"email": body.email.lower()})
     if existing:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="An account with this email already exists")
@@ -64,7 +75,7 @@ async def signup(body: EmailPasswordBody):
 
 @router.post("/login")
 async def login(body: EmailPasswordBody):
-    db = get_db()
+    db = get_core_db()
     user = await db.users.find_one({"email": body.email.lower()})
     if not user or not user.get("password_hash") or not verify_password(body.password, user["password_hash"]):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
@@ -96,7 +107,7 @@ async def login_with_google(body: GoogleLoginBody):
     if not email:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Google token had no email")
 
-    db = get_db()
+    db = get_core_db()
     user = await db.users.find_one({"email": email.lower()})
     if user is None:
         result = await db.users.insert_one(
