@@ -6,6 +6,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.core.db import get_db
 from app.core.security import decode_access_token, verify_bot_token
+from app.services import ai_brain
 
 router = APIRouter(tags=["ws"])
 
@@ -143,6 +144,11 @@ async def bot_ws(websocket: WebSocket):
 
     last_pong = asyncio.get_event_loop().time()
 
+    # Loaded once, lazily, on the first scan_fields — then reused for every
+    # subsequent scan on this same connection (including reload-recovery
+    # re-scans) so we don't re-hit Mongo for profile/documents every time.
+    profile_cache: dict | None = None
+
     async def heartbeat():
         nonlocal last_pong
         while True:
@@ -160,6 +166,82 @@ async def bot_ws(websocket: WebSocket):
 
     hb_task = asyncio.create_task(heartbeat())
 
+    async def handle_scan_fields(payload: dict):
+        nonlocal profile_cache
+        session_id = payload.get("session_id")
+        fields = payload.get("fields", [])
+
+        if profile_cache is None:
+            profile_cache = await ai_brain._load_profile_context(user_id)
+
+        async def run_stream():
+            try:
+                async with asyncio.timeout(ai_brain.AI_TIMEOUT_SECONDS + 2):
+                    async for index, value in ai_brain.stream_answers(user_id, fields, profile_cache):
+                        await websocket.send_text(
+                            json.dumps({"type": "answer_chunk", "payload": {"index": index, "value": value}})
+                        )
+            except (TimeoutError, asyncio.TimeoutError):
+                # AI call ran long — send whatever made it through (some chunks
+                # may already be sent) and complete anyway so the bot isn't
+                # left hanging indefinitely on a stuck provider call.
+                pass
+            except Exception:
+                # Any provider/network failure: complete with zero/partial
+                # answers rather than crashing the whole /ws/bot connection.
+                pass
+            finally:
+                await websocket.send_text(
+                    json.dumps({"type": "answers_complete", "payload": {"session_id": session_id}})
+                )
+
+        # Fire-and-forget so the main receive loop keeps handling pongs/other
+        # messages (e.g. a stop_session) while the AI call is in flight.
+        asyncio.create_task(run_stream())
+
+    async def handle_report_result(payload: dict):
+        """
+        Bot sends this after a fill+submit attempt completes. Writes a real
+        job_applications row and pushes job_progress_update to the dashboard
+        — the same event/shape internal.py's old /internal/applications
+        endpoint already produced, so dashboard.js needs no changes. This
+        replaces that REST+shared-secret path for bot traffic, per the
+        architecture decision to route all bot-originated events through
+        /ws/bot instead.
+        """
+        db = get_db()
+        now = datetime.now(timezone.utc)
+        doc = {
+            "user_id": user_id,
+            "role": payload.get("role_title") or "Unknown",
+            "company": payload.get("company_name") or "Unknown",
+            "site": payload.get("source_site_url") or payload.get("job_url") or "",
+            "status": payload.get("status", "pending"),
+            "link": payload.get("job_url"),
+            "reply_received": False,
+            "reply_snippet": None,
+            "applied_at": now,
+        }
+        result = await db.job_applications.insert_one(doc)
+        doc_id = str(result.inserted_id)
+
+        await manager.send_to_user(
+            user_id,
+            "job_progress_update",
+            {
+                "id": doc_id,
+                "role": doc["role"],
+                "company": doc["company"],
+                "site": doc["site"],
+                "status": doc["status"],
+                "link": doc["link"],
+                "reply_received": doc["reply_received"],
+                "applied_at": now.isoformat(),
+            },
+            kind="dashboard",
+        )
+        await websocket.send_text(json.dumps({"type": "report_ack", "payload": {"id": doc_id}}))
+
     try:
         while True:
             raw = await websocket.receive_text()
@@ -167,10 +249,13 @@ async def bot_ws(websocket: WebSocket):
                 msg = json.loads(raw)
             except ValueError:
                 continue
-            if msg.get("type") == "pong":
+            msg_type = msg.get("type")
+            if msg_type == "pong":
                 last_pong = asyncio.get_event_loop().time()
-            # Part B (brain layer) will handle question_detected / page-context
-            # messages here once built; A3 only needs connection lifecycle.
+            elif msg_type == "scan_fields":
+                await handle_scan_fields(msg.get("payload", msg))
+            elif msg_type == "report_result":
+                await handle_report_result(msg.get("payload", msg))
     except WebSocketDisconnect:
         pass
     finally:
