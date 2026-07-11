@@ -52,16 +52,39 @@ def _filterable_fields(fields: list[dict]) -> list[dict]:
     return out
 
 
+RESUME_TEXT_BUDGET_CHARS = 4000  # keeps the combined prompt bounded even with 2-3 uploaded docs
+
+
 async def _load_profile_context(user_id: str) -> dict:
     """Loaded once per session by the caller (ws.py) and reused across
     re-scans within that same /ws/bot connection — this function itself
-    is just the DB read; caching is the caller's job."""
+    is just the DB read; caching is the caller's job.
+
+    Now includes each document's extracted_text (populated at upload time
+    by resume_extract.py) so the AI actually reads resume content instead
+    of only ever seeing the about_paragraph — this was the explicit
+    LIMITATION called out in this module's old docstring; it's closed now."""
     db = await get_user_db(user_id)
     profile = await db.profiles.find_one({"user_id": user_id}) or {}
     documents = await db.documents.find({"user_id": user_id}).sort("created_at", -1).to_list(length=50)
+
+    resume_text_parts = []
+    budget_used = 0
+    for d in documents:
+        text = (d.get("extracted_text") or "").strip()
+        if not text:
+            continue
+        remaining = RESUME_TEXT_BUDGET_CHARS - budget_used
+        if remaining <= 0:
+            break
+        chunk = text[:remaining]
+        resume_text_parts.append(f"--- {d.get('title') or 'document'} ---\n{chunk}")
+        budget_used += len(chunk)
+
     return {
         "about_paragraph": profile.get("about_paragraph", ""),
         "documents": [{"title": d.get("title"), "type": d.get("type"), "url": d.get("url")} for d in documents],
+        "resume_text": "\n\n".join(resume_text_parts),
     }
 
 
@@ -125,14 +148,22 @@ def _build_prompt(fields: list[dict], profile: dict) -> str:
         )
 
     doc_lines = "\n".join(f'- {d["title"]} ({d["type"]}): {d["url"]}' for d in profile["documents"]) or "(none)"
+    resume_text = profile.get("resume_text") or ""
+    resume_section = resume_text if resume_text else "(no readable resume text — rely on the about paragraph only)"
 
     return f"""You are filling out a job application form on behalf of a candidate.
 Use ONLY the candidate information below — do not invent facts, employers, or dates not present here.
+When the resume text below and the about paragraph could both answer a field (e.g. exact job
+titles, years of experience, company names, skills), prefer the resume text — it's the more
+precise, factual source; the about paragraph is a looser summary.
 
 CANDIDATE ABOUT:
 {profile["about_paragraph"] or "(not provided)"}
 
-CANDIDATE DOCUMENTS:
+CANDIDATE RESUME TEXT (extracted from uploaded document):
+{resume_section}
+
+CANDIDATE DOCUMENTS ON FILE:
 {doc_lines}
 
 FORM FIELDS TO ANSWER:
