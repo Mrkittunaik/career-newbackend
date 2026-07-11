@@ -7,7 +7,7 @@ from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 
-from app.core.db import get_db
+from app.core.db import get_core_db, get_user_db
 from app.core.security import get_current_user_id
 
 router = APIRouter(prefix="/profile", tags=["profile"])
@@ -37,15 +37,18 @@ def _serialize_document(doc: dict) -> dict:
 
 @router.get("")
 async def get_profile(user_id: str = Depends(get_current_user_id)):
-    db = get_db()
-    profile = await db.profiles.find_one({"user_id": user_id})
+    user_db = await get_user_db(user_id)
+    profile = await user_db.profiles.find_one({"user_id": user_id})
     if profile is None:
         # Shouldn't normally happen (created at signup) but don't 500 if it does.
-        await db.profiles.insert_one({"user_id": user_id, "about_paragraph": "", "created_at": datetime.now(timezone.utc)})
+        await user_db.profiles.insert_one({"user_id": user_id, "about_paragraph": "", "created_at": datetime.now(timezone.utc)})
         profile = {"about_paragraph": ""}
 
-    user = await db.users.find_one({"_id": ObjectId(user_id)})
-    documents = await db.documents.find({"user_id": user_id}).sort("created_at", -1).to_list(length=200)
+    # email lives on the users collection, which is account-essential and
+    # always in the hosted core DB regardless of the user's storage_mode.
+    core_db = get_core_db()
+    user = await core_db.users.find_one({"_id": ObjectId(user_id)})
+    documents = await user_db.documents.find({"user_id": user_id}).sort("created_at", -1).to_list(length=200)
 
     return {
         "email": user["email"] if user else None,
@@ -56,7 +59,7 @@ async def get_profile(user_id: str = Depends(get_current_user_id)):
 
 @router.post("")
 async def update_profile(body: UpdateProfileBody, user_id: str = Depends(get_current_user_id)):
-    db = get_db()
+    db = await get_user_db(user_id)
     await db.profiles.update_one(
         {"user_id": user_id},
         {"$set": {"about_paragraph": body.about_paragraph, "updated_at": datetime.now(timezone.utc)}},
@@ -74,7 +77,7 @@ async def add_document(request: Request, user_id: str = Depends(get_current_user
     We branch on Content-Type since FastAPI can't mix File/Form and a JSON
     body in a single route signature.
     """
-    db = get_db()
+    db = await get_user_db(user_id)
     content_type = request.headers.get("content-type", "")
 
     if content_type.startswith("multipart/form-data"):
@@ -114,7 +117,7 @@ async def add_document(request: Request, user_id: str = Depends(get_current_user
 
 @router.delete("/documents/{doc_id}")
 async def delete_document(doc_id: str, user_id: str = Depends(get_current_user_id)):
-    db = get_db()
+    db = await get_user_db(user_id)
     try:
         oid = ObjectId(doc_id)
     except InvalidId:
