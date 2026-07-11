@@ -137,15 +137,22 @@ async def send_chat_message(body: ChatMessageBody, user_id: str = Depends(get_cu
     is_first_message = False
 
     if conversation_id:
-        await _get_owned_conversation(db, user_id, conversation_id)
+        convo = await _get_owned_conversation(db, user_id, conversation_id)
     else:
         # No thread given — start a fresh one, same as clicking "New chat"
         # would have, so callers that haven't been updated yet (or a first
         # message from a brand-new sidebar session) still work.
-        convo_doc = {"user_id": user_id, "title": _make_title(text), "created_at": now, "updated_at": now}
+        convo_doc = {
+            "user_id": user_id,
+            "title": _make_title(text),
+            "created_at": now,
+            "updated_at": now,
+            "intake": {},  # populated turn by turn as the intake flow collects role/location/etc.
+        }
         inserted = await db.conversations.insert_one(convo_doc)
         conversation_id = str(inserted.inserted_id)
         is_first_message = True
+        convo = convo_doc
 
     user_msg = {
         "user_id": user_id,
@@ -161,7 +168,7 @@ async def send_chat_message(body: ChatMessageBody, user_id: str = Depends(get_cu
     ).sort("created_at", 1).to_list(length=HISTORY_LIMIT)
     history = [{"role": d["role"], "content": d["content"]} for d in history_docs]
 
-    result = await agent_brain.handle_chat_message(user_id, text, history)
+    result = await agent_brain.handle_chat_message(user_id, text, history, convo.get("intake"))
 
     job_request_id = None
     if result["intent"] == "job_search":
@@ -170,6 +177,8 @@ async def send_chat_message(body: ChatMessageBody, user_id: str = Depends(get_cu
             "job_type": result["job_type"],
             "experience_level": result["experience_level"],
             "target_sites": result["target_sites"],
+            "location": result.get("location"),
+            "company_pref": result.get("company_pref"),
             "created_at": datetime.now(timezone.utc),
             "status": "queued",
             "source": "chat",
@@ -180,7 +189,9 @@ async def send_chat_message(body: ChatMessageBody, user_id: str = Depends(get_cu
         # Same live-kickoff as the structured job-request form (jobs.py) —
         # a chat-originated "find me frontend jobs" should behave exactly
         # like filling out the form, not silently do less because it came
-        # through a different entry point.
+        # through a different entry point. This only fires now because the
+        # intake state machine required an explicit "yes" first — see
+        # agent_brain.handle_chat_message.
         started = await start_automation_session(
             user_id, job_request_id, result["job_type"], result["experience_level"], result["target_sites"]
         )
@@ -201,8 +212,11 @@ async def send_chat_message(body: ChatMessageBody, user_id: str = Depends(get_cu
     await db.chat_messages.insert_one(assistant_msg)
 
     # Bump conversation's updated_at so the sidebar list re-sorts to the top,
-    # same as ChatGPT bumping the most recently active thread up.
-    update_fields = {"updated_at": reply_now}
+    # same as ChatGPT bumping the most recently active thread up. Also
+    # persist the intake progress so the NEXT message in this thread (even
+    # after a page reload) resumes the state machine instead of starting
+    # the intake over from scratch.
+    update_fields = {"updated_at": reply_now, "intake": result.get("intake", {})}
     if is_first_message:
         # Title was already set from the user's first message at creation
         # time above — nothing else to set here, just keep updated_at fresh.
@@ -221,5 +235,7 @@ async def send_chat_message(body: ChatMessageBody, user_id: str = Depends(get_cu
         "job_type": result.get("job_type"),
         "experience_level": result.get("experience_level"),
         "target_sites": result.get("target_sites"),
+        "intake": result.get("intake", {}),
+        "awaiting_confirmation": result.get("awaiting_confirmation", False),
         "created_at": reply_now,
     }
