@@ -52,6 +52,12 @@ def generate_bot_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+def verify_bot_token(raw_token: str, token_hash: str) -> bool:
+    """Verify a raw overlay/bot token against the stored hash. Reuses the same
+    bcrypt scheme as passwords — no separate hashing scheme for bot tokens."""
+    return verify_password(raw_token, token_hash)
+
+
 def mask_token(token: str) -> str:
     if len(token) <= 8:
         return "•" * len(token)
