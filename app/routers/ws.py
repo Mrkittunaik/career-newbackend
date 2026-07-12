@@ -338,6 +338,32 @@ async def bot_ws(websocket: WebSocket):
         if session_id:
             await session_manager.update_session(user_id, session_id, step="filling")
 
+        # File-type fields (resume/CV upload) never get an AI text answer —
+        # ai_brain explicitly skips them (SKIP_FIELD_TYPES). Instead, resolve
+        # which uploaded document to hand the bot up front, so the
+        # answers_complete payload can carry either a download path or an
+        # explicit warning — never silence. Silently sending nothing left
+        # the bot with no way to tell "no file field on this form" apart
+        # from "file field present but user never uploaded a resume."
+        resume_payload: dict = {}
+        if any(f.get("type") == "file" for f in fields):
+            doc = ai_brain.select_resume_document(profile_cache)
+            if doc:
+                resume_payload = {
+                    "resume_document_id": doc["id"],
+                    "resume_download_path": f"/api/v1/profile/documents/{doc['id']}/download",
+                    "resume_filename": doc.get("title"),
+                }
+            else:
+                resume_payload = {
+                    "resume_warning": "no_resume_uploaded",
+                    "resume_warning_message": (
+                        "This application has a resume/file upload field, but no resume "
+                        "is uploaded on your CareerOS profile. Upload one under Profile > "
+                        "Documents so future applications can attach it automatically."
+                    ),
+                }
+
         async def run_stream():
             try:
                 async with asyncio.timeout(ai_brain.AI_TIMEOUT_SECONDS + 2):
@@ -356,7 +382,10 @@ async def bot_ws(websocket: WebSocket):
                 pass
             finally:
                 await websocket.send_text(
-                    json.dumps({"type": "answers_complete", "payload": {"session_id": session_id}})
+                    json.dumps({
+                        "type": "answers_complete",
+                        "payload": {"session_id": session_id, **resume_payload},
+                    })
                 )
 
         # Fire-and-forget so the main receive loop keeps handling pongs/other
