@@ -83,9 +83,26 @@ async def _load_profile_context(user_id: str) -> dict:
 
     return {
         "about_paragraph": profile.get("about_paragraph", ""),
-        "documents": [{"title": d.get("title"), "type": d.get("type"), "url": d.get("url")} for d in documents],
+        "documents": [
+            {"id": str(d["_id"]), "title": d.get("title"), "type": d.get("type"), "url": d.get("url")}
+            for d in documents
+        ],
         "resume_text": "\n\n".join(resume_text_parts),
     }
+
+
+def select_resume_document(profile: dict) -> dict | None:
+    """Picks which uploaded document to hand the bot for file-type fields.
+    No AI call needed — just the most recently uploaded file-type document
+    (profile["documents"] is already sorted by created_at desc from the DB
+    query in _load_profile_context). Returns None if the user has never
+    uploaded a file-type document — the caller (ws.py) is responsible for
+    turning that into an explicit warning back to the bot rather than
+    silently sending nothing."""
+    for d in profile["documents"]:
+        if d.get("type") == "file":
+            return d
+    return None
 
 
 async def _resolve_provider_and_key(user_id: str) -> tuple[str, str]:
