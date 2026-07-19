@@ -201,6 +201,79 @@ async def already_decided(user_id: str, job: dict) -> dict | None:
 
 
 
+def _build_problem_prompt(problem: dict, profile: dict) -> str:
+    return f"""You are helping recover from a problem the automation bot just hit while
+working a job application. Decide the best next step yourself — only ask the
+human user if you genuinely cannot tell what to do safely.
+
+PROBLEM REPORTED BY THE BOT:
+Type: {problem.get("problem_type") or "(unspecified)"}
+Details: {problem.get("details") or "(none given)"}
+URL involved: {problem.get("url") or "(none)"}
+Context (what it was doing): {problem.get("context") or "(none given)"}
+
+CANDIDATE CONTEXT (for reference only, not usually relevant to this decision):
+{profile.get("about_paragraph") or "(not provided)"}
+
+Common problem types and the safe default action:
+- broken_link / page_not_found / 404: action=skip_job (this one listing can't
+  be reached — move on rather than stall the whole session over it).
+- login_required / paywall: action=skip_job unless the details suggest the
+  user is already supposed to be logged in, in which case action=ask_user.
+- unrecognized_page_layout / cannot_find_fields: action=skip_job (bot can't
+  safely fill a form it can't parse — don't guess at form fields).
+- rate_limited / blocked_by_site: action=retry_later.
+- anything ambiguous, risky (e.g. might submit wrong/incomplete data), or where
+  guessing could cost the user a real opportunity they'd care about: action=ask_user.
+
+Prefer resolving it yourself (skip_job or retry_later) over asking the user —
+only use ask_user when the situation is genuinely unclear or consequential
+enough that guessing wrong would be worse than a short delay for their answer.
+Never invent a reason or pretend certainty you don't have.
+
+Respond with ONLY a JSON object, no other text, no markdown fences:
+{{"action": "skip_job" or "retry_later" or "ask_user", "reason": "one short sentence why", "question_for_user": "only filled in if action is ask_user, otherwise empty string"}}"""
+
+
+async def resolve_problem(user_id: str, problem: dict, profile_cache: dict | None = None) -> dict:
+    """
+    Called when the bot hits something it can't push through on its own
+    (broken link, page it doesn't recognize, rate limiting, etc.) — see
+    ws.py's handle_report_problem. The AI decides the recovery step itself
+    by default (skip this job / retry later); it only hands the decision
+    back to the user (action="ask_user") when the situation is genuinely
+    ambiguous or risky enough that guessing wrong would cost the user more
+    than a short pause for their input would.
+
+    On any failure (no key, bad JSON, provider error) this defaults to
+    skip_job rather than stalling the whole automation session waiting on
+    something that may never resolve — same fail-open philosophy as
+    decide_job.
+    """
+    if profile_cache is None:
+        profile_cache = await ai_brain._load_profile_context(user_id)
+
+    provider, api_key = await ai_brain._resolve_provider_and_key(user_id)
+    if not api_key:
+        return {"action": "skip_job", "reason": "No AI key configured — skipping this one.", "question_for_user": ""}
+
+    prompt = _build_problem_prompt(problem, profile_cache)
+
+    try:
+        raw = await _call_once(provider, api_key, prompt)
+        parsed = json.loads(raw)
+        action = str(parsed.get("action", "skip_job")).strip().lower()
+        if action not in ("skip_job", "retry_later", "ask_user"):
+            action = "skip_job"
+        return {
+            "action": action,
+            "reason": str(parsed.get("reason", "")).strip() or "(no reason given)",
+            "question_for_user": str(parsed.get("question_for_user", "")).strip() if action == "ask_user" else "",
+        }
+    except Exception:
+        return {"action": "skip_job", "reason": "Recovery decision failed — skipping this one.", "question_for_user": ""}
+
+
 VALID_SITES = ["LinkedIn", "Indeed", "Glassdoor", "Naukri", "Monster", "ZipRecruiter", "Wellfound", "Dice", "SimplyHired"]
 
 # The four things the intake flow needs before it's allowed to ask "should I
@@ -244,7 +317,7 @@ def _intake_is_ready(intake: dict) -> bool:
     return True
 
 
-def _build_intake_prompt(message: str, history: list[dict], intake: dict, awaiting_confirmation: bool) -> str:
+def _build_intake_prompt(message: str, history: list[dict], intake: dict, awaiting_confirmation: bool, paused: bool) -> str:
     history_lines = "\n".join(f'{h["role"]}: {h["content"]}' for h in history[-8:]) or "(no prior messages)"
 
     known_lines = "\n".join(
@@ -267,23 +340,59 @@ info above. The LATEST USER MESSAGE below is their answer to that question.
   role to X", etc.): set confirmed_start=false, update any field they asked to
   change in "intake", and reply asking what they'd like to adjust (or just
   acknowledge the cancellation if they said no with no changes).
+- If it's clearly unrelated to confirming (a tangent question, small talk) treat
+  it the same way as the PAUSED/off-topic handling below: answer it, set
+  pause_intake=true, confirmed_start=false, and don't touch intake.
 Never set confirmed_start=true unless the user's LATEST message is clearly a yes."""
+    elif paused:
+        confirmation_instructions = """
+Intake is currently PAUSED — the user previously asked to stop/step away from the
+job-search questions (e.g. said "leave it", "later", "not now", or asked something
+unrelated), and the assistant respected that by not asking further intake
+questions since. The LATEST USER MESSAGE is what they're saying now.
+- If it's a real answer to resuming the job search (a role, location, an
+  affirmative like "ok let's continue", "back to it", or new job-search details),
+  set resume_intake=true, extract anything usable into "intake", and continue the
+  flow naturally: if that answer combined with what's already known completes
+  everything, ask to confirm; otherwise ask for the next missing piece.
+- If it's still unrelated (another tangent, more small talk, another question),
+  answer that question directly and helpfully, keep resume_intake=false, and
+  don't touch intake or ask any job-search question this turn — let the user
+  bring it back up themselves, like a person would.
+Never resume the job-search questions on your own initiative while paused —
+only resume once the user's message is clearly about the job search again."""
     else:
         confirmation_instructions = """
-Not awaiting confirmation right now — this is a normal intake turn. Extract any
-new info the user just gave into "intake" (merge with what's already known,
-don't guess). If role, location, experience_type, and at least one target_site
-are ALL known after this turn, set ready=true and make "reply" a short summary
-of everything collected ending in a clear yes/no question: "Should I start
-applying now?". Otherwise set ready=false and make "reply" ONE short, friendly
-question asking for the single most important missing piece — ask in this
-priority order: role -> location -> experience_type -> target_sites ->
-company_pref. Never ask about more than one missing field in the same message."""
+Not awaiting confirmation right now — this is a normal intake turn.
+FIRST, decide what kind of message this is:
+1. A direct answer to what was just asked (or new job-search info volunteered
+   early) -> extract it into "intake" (merge with what's already known, don't
+   guess), then continue: if role, location, experience_type, and at least one
+   target_site are ALL known, set ready=true and "reply" is a short summary
+   ending in a clear yes/no question ("Should I start applying now?"). Otherwise
+   set ready=false and "reply" asks ONE short, friendly question for the single
+   most important missing piece, in this order: role -> location ->
+   experience_type -> target_sites -> company_pref. Never re-ask about a field
+   already known, and never ask about more than one missing field per turn.
+2. An explicit request to stop/pause/come back later ("leave it", "we'll do this
+   later", "not now", "hold on") -> set pause_intake=true, ready=false, and
+   "reply" is a short, warm acknowledgement that doesn't ask anything further
+   (e.g. "No problem — just say the word whenever you want to pick this back
+   up."). Don't guess at or discard the intake already collected.
+3. An unrelated tangent (a different question, small talk, a product question)
+   that ISN'T a stop request -> treat this like a helpful human would when
+   interrupted mid-conversation: actually answer their question well in "reply",
+   set pause_intake=true so the next turn doesn't rigidly re-ask the pending
+   intake question, and don't touch intake this turn. Never invent facts to
+   answer it — if you genuinely don't know, say so plainly instead of guessing.
+Never fabricate an answer just to seem helpful — if you don't know something
+factual, say you're not sure rather than making it up."""
 
     return f"""You are the job-search intake assistant inside CareerOS. Your job is to
-collect enough information before any automation starts, one question at a time —
-never dump multiple questions in one message, and never start automation without
-an explicit yes from the user.
+collect enough information before any automation starts, one question at a time,
+while still holding a normal, human conversation — never dump multiple questions
+in one message, never start automation without an explicit yes, never re-ask
+something already known, and never invent information you don't actually have.
 
 RECENT CONVERSATION:
 {history_lines}
@@ -298,12 +407,8 @@ VALID TARGET SITES (only use these, spelled exactly): {", ".join(VALID_SITES)}
 
 {confirmation_instructions}
 
-If the latest message is unrelated to a job search (small talk, a question about
-the product, etc.) and no intake is in progress, just reply normally with
-ready=false, confirmed_start=false, and leave intake empty/unchanged.
-
 Respond with ONLY a JSON object, no other text, no markdown fences:
-{{"intake": {{"role": "...", "location": "...", "experience_type": "...", "company_pref": "...", "target_sites": [...]}}, "ready": true or false, "confirmed_start": true or false, "reply": "..."}}
+{{"intake": {{"role": "...", "location": "...", "experience_type": "...", "company_pref": "...", "target_sites": [...]}}, "ready": true or false, "confirmed_start": true or false, "pause_intake": true or false, "resume_intake": true or false, "reply": "..."}}
 Omit or leave blank any intake field you don't have new info for."""
 
 
@@ -339,8 +444,9 @@ async def handle_chat_message(user_id: str, message: str, history: list[dict], i
 
     intake_state = intake_state or {}
     awaiting_confirmation = intake_state.get("status") == "awaiting_confirmation"
+    paused = intake_state.get("status") == "paused"
 
-    prompt = _build_intake_prompt(message, history, intake_state, awaiting_confirmation)
+    prompt = _build_intake_prompt(message, history, intake_state, awaiting_confirmation, paused)
     try:
         raw = await _call_once(provider, api_key, prompt)
         parsed = json.loads(raw)
@@ -369,6 +475,21 @@ async def handle_chat_message(user_id: str, message: str, history: list[dict], i
             "target_sites": merged_intake.get("target_sites") or ["LinkedIn", "Indeed"],
             "location": merged_intake.get("location"),
             "company_pref": merged_intake.get("company_pref") or "any",
+        }
+
+    # Paused: the user asked to stop, or went off on a tangent — the reply
+    # already answers/acknowledges that, and we deliberately don't push
+    # ready/awaiting_confirmation forward this turn so the next message
+    # isn't rigidly forced back into the intake question. Only a message
+    # the AI recognizes as "back to the job search" (resume_intake=true)
+    # clears this and lets normal intake logic resume.
+    if bool(parsed.get("pause_intake")) and not bool(parsed.get("resume_intake")):
+        merged_intake["status"] = "paused"
+        return {
+            "intent": "chat",
+            "reply": reply,
+            "intake": merged_intake,
+            "awaiting_confirmation": False,
         }
 
     ready = bool(parsed.get("ready")) or _intake_is_ready(merged_intake)
