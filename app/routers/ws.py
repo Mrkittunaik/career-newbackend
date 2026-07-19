@@ -77,10 +77,10 @@ async def start_automation_session(
 
     Returns False (and does nothing else) if the bot isn't currently
     connected — the job_requests document still exists with status
-    "queued", so nothing is lost; the next time the bot comes online it
-    won't auto-pick this up (that cross-session "resume a never-started
-    request" queue-drain is a separate, later piece — this covers the
-    "bot already open" case, which is the common one).
+    "queued", so nothing is lost. The bot_ws() connect handler now drains
+    the oldest queued request automatically the next time this user's bot
+    comes online (see get_next_queued_job_request), so this is no longer
+    a dead end — just deferred until the bot reconnects.
     """
     if not manager.is_bot_online(user_id) or not target_sites:
         return False
@@ -252,6 +252,28 @@ async def bot_ws(websocket: WebSocket):
             },
             kind="bot",
         )
+    else:
+        # No in-flight session to resume — but the user may have asked for
+        # a job search (via chat or the form) while the bot was closed.
+        # Previously that request just sat at job_requests.status="queued"
+        # forever, since start_automation_session() only fires at the
+        # moment the request is created and gives up silently if the bot
+        # isn't connected yet. Drain the oldest queued request now instead.
+        queued = await session_manager.get_next_queued_job_request(user_id)
+        if queued is not None:
+            job_request_id = str(queued["_id"])
+            session = await session_manager.start_session(
+                user_id,
+                job_request_id,
+                queued.get("job_type", ""),
+                queued.get("experience_level", "any"),
+                queued.get("target_sites") or [],
+            )
+            db = await get_user_db(user_id)
+            await db.job_requests.update_one(
+                {"_id": queued["_id"]}, {"$set": {"status": "processing"}}
+            )
+            await _open_site_for_session(user_id, session)
 
     async def heartbeat():
         nonlocal last_pong
