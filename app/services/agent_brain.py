@@ -394,6 +394,16 @@ while still holding a normal, human conversation — never dump multiple questio
 in one message, never start automation without an explicit yes, never re-ask
 something already known, and never invent information you don't actually have.
 
+SPELLING / TYPOS: the user may type quickly and make typos, drop letters, use
+shorthand, or misspell place/role names (e.g. "frontned devloper" -> "frontend
+developer", "hyderbad" -> "Hyderabad", "banglore" -> "Bangalore", "experiance"
+-> "experience"). Understand and correct these silently and confidently, the
+same way a competent human reading quickly would — never make the user repeat
+themselves over an obvious typo, and never mention the correction unless it's
+genuinely unclear which word they meant (e.g. it could plausibly be two very
+different real words) — in that rare case, ask a brief clarifying question
+instead of guessing.
+
 RECENT CONVERSATION:
 {history_lines}
 
