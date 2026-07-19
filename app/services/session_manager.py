@@ -93,6 +93,32 @@ async def update_session(user_id: str, session_id: str, **fields) -> None:
     await db.automation_sessions.update_one({"_id": ObjectId(session_id)}, {"$set": fields})
 
 
+# Human-readable label per step, for the live "what's happening right now"
+# status card on the dashboard/chat UI — keeps that wording in one place
+# instead of duplicated wherever a step change gets pushed to the frontend.
+STEP_LABELS = {
+    "opening_site": "Opening {site}…",
+    "awaiting_filters": "Applying filters on {site}…",
+    "scanning": "Scanning listings on {site}…",
+    "awaiting_decision": "Reviewing a job listing…",
+    "filling": "Filling out the application…",
+    "awaiting_next_page": "Loading more listings…",
+    "done": "Done.",
+    "failed": "Stopped — {reason}",
+}
+
+
+def describe_step(step: str, site: str | None = None, reason: str | None = None) -> str:
+    """Turns a raw step (+ context) into the short human sentence the status
+    card shows. Falls back to the raw step name for anything not in
+    STEP_LABELS rather than showing nothing."""
+    template = STEP_LABELS.get(step, step or "Working…")
+    try:
+        return template.format(site=site or "the site", reason=reason or "unknown reason")
+    except (KeyError, IndexError):
+        return template
+
+
 async def increment_counter(user_id: str, session_id: str, field_name: str) -> None:
     db = await get_user_db(user_id)
     await db.automation_sessions.update_one(
