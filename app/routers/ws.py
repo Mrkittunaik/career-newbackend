@@ -103,6 +103,7 @@ async def _open_site_for_session(user_id: str, session: dict) -> None:
     if site_index >= len(target_sites):
         await session_manager.complete_session(user_id, session_id)
         await manager.send_to_user(user_id, "session_complete", {"session_id": session_id}, kind="bot")
+        await _push_status(user_id, session_id, "done")
         await manager.send_to_user(
             user_id,
             "daily_counter_update",
@@ -117,6 +118,7 @@ async def _open_site_for_session(user_id: str, session: dict) -> None:
     await session_manager.update_session(
         user_id, session_id, step="opening_site", current_url=built["url"]
     )
+    await _push_status(user_id, session_id, "opening_site", site=site_name)
     await manager.send_to_user(
         user_id,
         "open_site",
@@ -129,6 +131,19 @@ async def _open_site_for_session(user_id: str, session: dict) -> None:
             "experience_level": session["experience_level"],
         },
         kind="bot",
+    )
+
+
+async def _push_status(user_id: str, session_id: str, step: str, site: str | None = None, reason: str | None = None) -> None:
+    """Sends the live 'what's happening right now' status card to the
+    dashboard/chat UI. Kept as a thin wrapper around session_manager's
+    describe_step so every call site pushes the same wording it just
+    persisted — one source of truth for the label text."""
+    await manager.send_to_user(
+        user_id,
+        "bot_status_update",
+        {"session_id": session_id, "step": step, "message": session_manager.describe_step(step, site, reason)},
+        kind="dashboard",
     )
 
 
@@ -308,6 +323,7 @@ async def bot_ws(websocket: WebSocket):
 
         if needs_ui_filters:
             await session_manager.update_session(user_id, session_id, step="awaiting_filters")
+            await _push_status(user_id, session_id, "awaiting_filters", site=payload.get("site"))
             await manager.send_to_user(
                 user_id,
                 "apply_filters",
@@ -316,6 +332,7 @@ async def bot_ws(websocket: WebSocket):
             )
         else:
             await session_manager.update_session(user_id, session_id, step="scanning")
+            await _push_status(user_id, session_id, "scanning", site=payload.get("site"))
 
     async def handle_filters_applied(payload: dict):
         """Bot confirms it clicked through the on-page filter UI. Either
@@ -324,6 +341,7 @@ async def bot_ws(websocket: WebSocket):
         session_id = payload.get("session_id")
         if session_id:
             await session_manager.update_session(user_id, session_id, step="scanning")
+            await _push_status(user_id, session_id, "scanning", site=payload.get("site"))
 
     async def handle_no_more_jobs(payload: dict):
         """
@@ -359,6 +377,7 @@ async def bot_ws(websocket: WebSocket):
 
         if session_id:
             await session_manager.update_session(user_id, session_id, step="filling")
+            await _push_status(user_id, session_id, "filling")
 
         # File-type fields (resume/CV upload) never get an AI text answer —
         # ai_brain explicitly skips them (SKIP_FIELD_TYPES). Instead, resolve
@@ -539,6 +558,7 @@ async def bot_ws(websocket: WebSocket):
             await session_manager.update_session(
                 user_id, session_id, step="awaiting_decision", current_job=job
             )
+            await _push_status(user_id, session_id, "awaiting_decision")
 
         existing = await agent_brain.already_decided(user_id, job)
         if existing is not None:
@@ -547,6 +567,24 @@ async def bot_ws(websocket: WebSocket):
             decision_enum, reason = await agent_brain.decide_job(user_id, job, profile_cache)
             decision = decision_enum.value
             await agent_brain.record_decision(user_id, job, decision_enum, reason)
+
+        # Distinct "why" card, separate from the plain status line — the
+        # dashboard/chat UI renders this as its own box (decision + reason +
+        # which job it was about) rather than folding it into the generic
+        # status text, so the user can see the actual reasoning per job
+        # without it disappearing the moment the next status update arrives.
+        await manager.send_to_user(
+            user_id,
+            "job_decision_reason",
+            {
+                "session_id": session_id,
+                "job_title": job.get("title"),
+                "company": job.get("company"),
+                "decision": decision,
+                "reason": reason,
+            },
+            kind="dashboard",
+        )
 
         await websocket.send_text(
             json.dumps(
