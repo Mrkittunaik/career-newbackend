@@ -19,7 +19,7 @@ users; a fresh conversation is created the next time they send a message
 with no conversation_id given.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from bson import ObjectId
 from bson.errors import InvalidId
@@ -35,6 +35,13 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 
 HISTORY_LIMIT = 50
 TITLE_MAX_LEN = 48
+
+# If the user's last message in this thread was longer ago than this, treat
+# any in-progress intake (awaiting yes/no, paused mid-tangent, or still
+# collecting) as expired rather than resuming it against whatever they say
+# next. Closing the app/tab and coming back later should feel like walking
+# up to someone fresh, not being held mid-sentence from last time.
+STALE_INTAKE_GAP = timedelta(minutes=30)
 
 
 class ChatMessageBody(BaseModel):
@@ -163,12 +170,26 @@ async def send_chat_message(body: ChatMessageBody, user_id: str = Depends(get_cu
     }
     await db.chat_messages.insert_one(user_msg)
 
+    # If the user is coming back after a long gap (closed the site/app and
+    # reopened later), don't let a leftover in-progress intake — awaiting
+    # a yes/no, or paused mid-tangent — hijack whatever they say next. A
+    # bare "hi" after hours away shouldn't get answered with "please
+    # confirm whether to start automation" about a search from last time.
+    # A short gap (still actively chatting) keeps the state exactly as-is.
+    intake = convo.get("intake") or {}
+    last_activity = convo.get("updated_at")
+    if intake.get("status") in ("awaiting_confirmation", "paused", "collecting") and last_activity:
+        if last_activity.tzinfo is None:
+            last_activity = last_activity.replace(tzinfo=timezone.utc)
+        if (now - last_activity) > STALE_INTAKE_GAP:
+            intake = {}
+
     history_docs = await db.chat_messages.find(
         {"conversation_id": conversation_id, "user_id": user_id}
     ).sort("created_at", 1).to_list(length=HISTORY_LIMIT)
     history = [{"role": d["role"], "content": d["content"]} for d in history_docs]
 
-    result = await agent_brain.handle_chat_message(user_id, text, history, convo.get("intake"))
+    result = await agent_brain.handle_chat_message(user_id, text, history, intake)
 
     job_request_id = None
     if result["intent"] == "job_search":
