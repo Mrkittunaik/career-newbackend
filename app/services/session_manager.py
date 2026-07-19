@@ -74,6 +74,19 @@ async def get_resumable_session(user_id: str) -> dict | None:
     )
 
 
+async def get_next_queued_job_request(user_id: str) -> dict | None:
+    """Closes the gap where a job_request made while the bot was offline
+    just sat at status="queued" forever. Called on bot reconnect, after
+    get_resumable_session finds nothing to resume. Oldest queued request
+    first (FIFO), since a user who asked for several searches while the
+    bot was closed expects them worked in the order requested."""
+    db = await get_user_db(user_id)
+    return await db.job_requests.find_one(
+        {"user_id": user_id, "status": "queued"},
+        sort=[("created_at", 1)],
+    )
+
+
 async def update_session(user_id: str, session_id: str, **fields) -> None:
     db = await get_user_db(user_id)
     fields["updated_at"] = datetime.now(timezone.utc)
