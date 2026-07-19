@@ -469,6 +469,54 @@ async def bot_ws(websocket: WebSocket):
         )
         await websocket.send_text(json.dumps({"type": "report_ack", "payload": {"id": doc_id}}))
 
+    async def handle_report_problem(payload: dict):
+        """
+        New, additive message type: the bot sends this when it hits something
+        it can't push through on its own mid-task — a broken/dead link, a page
+        layout it doesn't recognize, rate limiting, a login wall, etc. Mirrors
+        handle_job_decision's shape: the AI resolves it itself by default
+        (skip_job / retry_later) and only escalates to the human (ask_user)
+        when the situation is genuinely ambiguous or consequential enough that
+        guessing wrong would cost the user more than a short pause would.
+
+        On ask_user, the question is pushed to BOTH sockets — "bot" so the bot
+        knows to hold this job open pending an answer, and "dashboard" so the
+        user actually sees the question surfaced live rather than needing to
+        go dig through chat. The next chat message the user sends is a normal
+        message; nothing here forces a special reply format from them — the
+        bot should treat any answer to the (persisted) pending question as
+        the resolution and query for it after a "problem_resolved" ack, since
+        this isn't a request/response like job_decision — it can wait an
+        arbitrary amount of time for the human.
+        """
+        nonlocal profile_cache
+        problem = payload.get("problem", {})
+        session_id = payload.get("session_id")
+
+        if profile_cache is None:
+            profile_cache = await ai_brain._load_profile_context(user_id)
+
+        if session_id:
+            await session_manager.update_session(user_id, session_id, step="awaiting_decision")
+
+        resolution = await agent_brain.resolve_problem(user_id, problem, profile_cache)
+
+        if resolution["action"] == "ask_user":
+            await manager.send_to_user(
+                user_id,
+                "bot_question",
+                {
+                    "session_id": session_id,
+                    "question": resolution["question_for_user"],
+                    "problem": problem,
+                },
+                kind="dashboard",
+            )
+
+        await websocket.send_text(
+            json.dumps({"type": "problem_resolution", "payload": {"session_id": session_id, **resolution}})
+        )
+
     async def handle_job_decision(payload: dict):
         """
         New, additive message type: the bot sends this BEFORE scanning a
@@ -521,6 +569,8 @@ async def bot_ws(websocket: WebSocket):
                 last_pong = asyncio.get_event_loop().time()
             elif msg_type == "job_decision":
                 await handle_job_decision(msg.get("payload", msg))
+            elif msg_type == "report_problem":
+                await handle_report_problem(msg.get("payload", msg))
             elif msg_type == "scan_fields":
                 await handle_scan_fields(msg.get("payload", msg))
             elif msg_type == "report_result":
