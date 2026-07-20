@@ -83,6 +83,11 @@ async def _load_profile_context(user_id: str) -> dict:
 
     return {
         "about_paragraph": profile.get("about_paragraph", ""),
+        "skills": profile.get("skills") or [],
+        "salary_expectation": profile.get("salary_expectation") or "",
+        "remote_pref": profile.get("remote_pref") or "",
+        "preferred_locations": profile.get("preferred_locations") or [],
+        "target_companies": profile.get("target_companies") or [],
         "documents": [
             {"id": str(d["_id"]), "title": d.get("title"), "type": d.get("type"), "url": d.get("url")}
             for d in documents
