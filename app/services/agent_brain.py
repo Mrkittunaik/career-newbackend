@@ -295,7 +295,7 @@ def _merge_intake(current: dict, extracted: dict) -> dict:
     should never wipe out a role the user already gave two turns ago just
     because this turn's extraction returned an empty string for it."""
     merged = dict(current or {})
-    for key in ("role", "location", "experience_type", "company_pref"):
+    for key in ("role", "location", "experience_type", "company_pref", "salary_expectation", "remote_pref"):
         value = (extracted.get(key) or "").strip()
         if value:
             merged[key] = value
@@ -304,6 +304,9 @@ def _merge_intake(current: dict, extracted: dict) -> dict:
         valid = [s for s in sites if s in VALID_SITES]
         if valid:
             merged["target_sites"] = valid
+    companies = extracted.get("target_companies")
+    if companies:
+        merged["target_companies"] = list(companies)
     return merged
 
 
@@ -317,7 +320,14 @@ def _intake_is_ready(intake: dict) -> bool:
     return True
 
 
-def _build_intake_prompt(message: str, history: list[dict], intake: dict, awaiting_confirmation: bool, paused: bool) -> str:
+def _build_intake_prompt(
+    message: str,
+    history: list[dict],
+    intake: dict,
+    awaiting_confirmation: bool,
+    paused: bool,
+    user_profile: dict | None = None,
+) -> str:
     history_lines = "\n".join(f'{h["role"]}: {h["content"]}' for h in history[-8:]) or "(no prior messages)"
 
     known_lines = "\n".join(
@@ -327,8 +337,43 @@ def _build_intake_prompt(message: str, history: list[dict], intake: dict, awaiti
             f"- experience_type: {intake.get('experience_type') or '(not yet known)'} (must be one of: internship, fresher, experienced)",
             f"- company_pref: {intake.get('company_pref') or '(not yet known, optional)'} (one of: startup, top_company, any)",
             f"- target_sites: {', '.join(intake.get('target_sites') or []) or '(not yet known)'}",
+            f"- salary_expectation: {intake.get('salary_expectation') or '(not yet known, optional)'}",
+            f"- remote_pref: {intake.get('remote_pref') or '(not yet known, optional)'} (one of: remote, onsite, hybrid, any)",
+            f"- target_companies: {', '.join(intake.get('target_companies') or []) or '(not yet known, optional)'}",
         ]
     )
+
+    user_profile = user_profile or {}
+    profile_lines = "\n".join(
+        [
+            f"- about: {user_profile.get('about_paragraph') or '(none saved)'}",
+            f"- skills: {', '.join(user_profile.get('skills') or []) or '(none saved)'}",
+            f"- usual salary expectation: {user_profile.get('salary_expectation') or '(none saved)'}",
+            f"- usual remote preference: {user_profile.get('remote_pref') or '(none saved)'}",
+            f"- usual preferred locations: {', '.join(user_profile.get('preferred_locations') or []) or '(none saved)'}",
+            f"- usual target companies: {', '.join(user_profile.get('target_companies') or []) or '(none saved)'}",
+        ]
+    )
+    profile_instructions = f"""
+THE USER'S SAVED PROFILE (persists across all their chats, not just this one):
+{profile_lines}
+
+- If this search's intake is missing something the saved profile already
+  answers generally (e.g. no location given here but they have a usual
+  preferred location saved), you may quietly use it as the default instead
+  of asking again — but only for optional fields (salary_expectation,
+  remote_pref, target_companies), never for the required core fields (role,
+  location, experience_type, target_sites), since those are specific to
+  THIS search and worth confirming fresh each time.
+- If the user says something about themselves in general — not just for this
+  one search — like "I know Python and React", "I usually want remote work",
+  "I prefer startups", "my expected salary is X", or corrects something about
+  themselves ("actually I have 2 years experience, not fresher"), that's a
+  PROFILE update, not just intake for this search. Put it in BOTH "intake"
+  (so it applies now) AND "profile_updates" (so it's remembered going
+  forward). Only include profile_updates when the user is actually telling
+  you something about themselves generally — most turns will have this
+  empty."""
 
     if awaiting_confirmation:
         confirmation_instructions = """
@@ -369,11 +414,17 @@ FIRST, decide what kind of message this is:
    early) -> extract it into "intake" (merge with what's already known, don't
    guess), then continue: if role, location, experience_type, and at least one
    target_site are ALL known, set ready=true and "reply" is a short summary
-   ending in a clear yes/no question ("Should I start applying now?"). Otherwise
-   set ready=false and "reply" asks ONE short, friendly question for the single
-   most important missing piece, in this order: role -> location ->
-   experience_type -> target_sites -> company_pref. Never re-ask about a field
-   already known, and never ask about more than one missing field per turn.
+   ending in a clear yes/no question ("Should I start applying now?"). The
+   optional fields (company_pref, salary_expectation, remote_pref,
+   target_companies) do NOT block ready — never hold up starting the search
+   over them. Otherwise set ready=false and "reply" asks ONE short, friendly
+   question for the single most important missing piece, in this priority
+   order: role -> location -> experience_type -> target_sites -> (optionally,
+   only if the conversation naturally allows one more question before
+   confirming) company_pref -> remote_pref -> salary_expectation ->
+   target_companies. Never re-ask about a field already known (including
+   anything filled in from the saved profile above), and never ask about more
+   than one missing field per turn.
 2. An explicit request to stop/pause/come back later ("leave it", "we'll do this
    later", "not now", "hold on") -> set pause_intake=true, ready=false, and
    "reply" is a short, warm acknowledgement that doesn't ask anything further
@@ -414,12 +465,67 @@ INFO COLLECTED SO FAR:
 {known_lines}
 
 VALID TARGET SITES (only use these, spelled exactly): {", ".join(VALID_SITES)}
+{profile_instructions}
 
 {confirmation_instructions}
 
 Respond with ONLY a JSON object, no other text, no markdown fences:
-{{"intake": {{"role": "...", "location": "...", "experience_type": "...", "company_pref": "...", "target_sites": [...]}}, "ready": true or false, "confirmed_start": true or false, "pause_intake": true or false, "resume_intake": true or false, "reply": "..."}}
-Omit or leave blank any intake field you don't have new info for."""
+{{"intake": {{"role": "...", "location": "...", "experience_type": "...", "company_pref": "...", "target_sites": [...], "salary_expectation": "...", "remote_pref": "...", "target_companies": [...]}}, "profile_updates": {{"about_paragraph": "...", "skills": [...], "salary_expectation": "...", "remote_pref": "...", "preferred_locations": [...], "target_companies": [...]}}, "ready": true or false, "confirmed_start": true or false, "pause_intake": true or false, "resume_intake": true or false, "reply": "..."}}
+Omit or leave blank any intake field you don't have new info for. Leave
+"profile_updates" as an empty object {{}} unless the user just told you
+something about themselves in general this turn."""
+
+
+_PROFILE_LIST_FIELDS = {"skills", "preferred_locations", "target_companies"}
+_PROFILE_SCALAR_FIELDS = {"about_paragraph", "salary_expectation", "remote_pref"}
+
+
+async def _apply_profile_updates(user_id: str, updates: dict) -> None:
+    """
+    Persists facts the user shared about themselves in chat (see the
+    "profile_updates" the intake prompt produces) into the same `profiles`
+    collection Settings/Profile page reads and writes — one profile, shared
+    across the whole app, not something separate chat maintains on its own.
+
+    List fields (skills, target_companies, preferred_locations) are merged
+    additively — "I know Python" this chat and "I also know React" in
+    another chat should both stick, not have the second overwrite the
+    first. Scalar fields (about_paragraph, salary_expectation, remote_pref)
+    are simple replace-with-latest, since those are singular facts where
+    the most recent statement is the correct current one (e.g. a corrected
+    salary expectation should replace the old one, not merge with it).
+    """
+    db = await get_user_db(user_id)
+    existing = await db.profiles.find_one({"user_id": user_id}) or {}
+
+    set_fields: dict = {}
+    for key in _PROFILE_SCALAR_FIELDS:
+        value = updates.get(key)
+        if value:
+            set_fields[key] = value
+
+    for key in _PROFILE_LIST_FIELDS:
+        new_items = updates.get(key)
+        if not new_items:
+            continue
+        current = existing.get(key) or []
+        # Case-insensitive de-dupe so "Python" mentioned twice doesn't
+        # produce two entries, while preserving the original casing already
+        # stored (or the new casing, for genuinely new items).
+        seen_lower = {str(i).strip().lower() for i in current}
+        merged = list(current)
+        for item in new_items:
+            item = str(item).strip()
+            if item and item.lower() not in seen_lower:
+                merged.append(item)
+                seen_lower.add(item.lower())
+        set_fields[key] = merged
+
+    if not set_fields:
+        return
+
+    set_fields["updated_at"] = datetime.now(timezone.utc)
+    await db.profiles.update_one({"user_id": user_id}, {"$set": set_fields}, upsert=True)
 
 
 async def handle_chat_message(user_id: str, message: str, history: list[dict], intake_state: dict | None = None) -> dict:
@@ -455,8 +561,9 @@ async def handle_chat_message(user_id: str, message: str, history: list[dict], i
     intake_state = intake_state or {}
     awaiting_confirmation = intake_state.get("status") == "awaiting_confirmation"
     paused = intake_state.get("status") == "paused"
+    user_profile = await ai_brain._load_profile_context(user_id)
 
-    prompt = _build_intake_prompt(message, history, intake_state, awaiting_confirmation, paused)
+    prompt = _build_intake_prompt(message, history, intake_state, awaiting_confirmation, paused, user_profile)
     try:
         raw = await _call_once(provider, api_key, prompt)
         parsed = json.loads(raw)
@@ -471,6 +578,10 @@ async def handle_chat_message(user_id: str, message: str, history: list[dict], i
     merged_intake = _merge_intake(intake_state, parsed.get("intake") or {})
     reply = parsed.get("reply") or "Got it."
     confirmed = bool(parsed.get("confirmed_start")) and awaiting_confirmation
+
+    profile_updates = parsed.get("profile_updates") or {}
+    if profile_updates:
+        await _apply_profile_updates(user_id, profile_updates)
 
     if confirmed:
         merged_intake["status"] = "confirmed"
