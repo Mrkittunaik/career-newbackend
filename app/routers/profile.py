@@ -22,7 +22,12 @@ MAX_RESUME_BYTES = 200 * 1024  # 200KB cap on resume uploads
 
 
 class UpdateProfileBody(BaseModel):
-    about_paragraph: str
+    about_paragraph: str | None = None
+    skills: list[str] | None = None
+    salary_expectation: str | None = None
+    remote_pref: str | None = None
+    preferred_locations: list[str] | None = None
+    target_companies: list[str] | None = None
 
 
 class LinkDocumentBody(BaseModel):
@@ -66,6 +71,11 @@ async def get_profile(user_id: str = Depends(get_current_user_id)):
     return {
         "email": user["email"] if user else None,
         "about_paragraph": profile.get("about_paragraph", ""),
+        "skills": profile.get("skills") or [],
+        "salary_expectation": profile.get("salary_expectation") or "",
+        "remote_pref": profile.get("remote_pref") or "",
+        "preferred_locations": profile.get("preferred_locations") or [],
+        "target_companies": profile.get("target_companies") or [],
         "documents": [_serialize_document(d) for d in documents],
     }
 
@@ -73,12 +83,18 @@ async def get_profile(user_id: str = Depends(get_current_user_id)):
 @router.post("")
 async def update_profile(body: UpdateProfileBody, user_id: str = Depends(get_current_user_id)):
     db = await get_user_db(user_id)
-    await db.profiles.update_one(
-        {"user_id": user_id},
-        {"$set": {"about_paragraph": body.about_paragraph, "updated_at": datetime.now(timezone.utc)}},
-        upsert=True,
-    )
-    return {"about_paragraph": body.about_paragraph}
+    # Only touch fields actually sent — this endpoint is now also called by
+    # the chat brain (see agent_brain.py's apply_profile_updates) with just
+    # whatever one or two fields the user mentioned in conversation, e.g.
+    # only skills, without wiping about_paragraph or anything else unset.
+    update_fields = {k: v for k, v in body.model_dump(exclude_unset=True).items() if v is not None}
+    if not update_fields:
+        existing = await db.profiles.find_one({"user_id": user_id}) or {}
+        return {k: existing.get(k) for k in body.model_fields}
+
+    update_fields["updated_at"] = datetime.now(timezone.utc)
+    await db.profiles.update_one({"user_id": user_id}, {"$set": update_fields}, upsert=True)
+    return update_fields
 
 
 @router.post("/documents", status_code=status.HTTP_201_CREATED)
