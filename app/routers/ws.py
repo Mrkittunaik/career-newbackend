@@ -113,7 +113,11 @@ async def _open_site_for_session(user_id: str, session: dict) -> None:
         return
 
     site_name = target_sites[site_index]
-    built = site_catalog.build_search_url(site_name, session["job_type"], session["experience_level"])
+    custom_sites_doc = await get_core_db().settings.find_one({"user_id": user_id}) or {}
+    built = site_catalog.build_search_url(
+        site_name, session["job_type"], session["experience_level"],
+        custom_sites=custom_sites_doc.get("custom_sites") or [],
+    )
 
     await session_manager.update_session(
         user_id, session_id, step="opening_site", current_url=built["url"]
@@ -433,6 +437,32 @@ async def bot_ws(websocket: WebSocket):
         # messages (e.g. a stop_session) while the AI call is in flight.
         asyncio.create_task(run_stream())
 
+    async def handle_scan_login_fields(payload: dict):
+        session_id = payload.get("session_id")
+        site = payload.get("site", "")
+
+        if session_id:
+            await _push_status(user_id, session_id, "logging_in")
+
+        from app.routers.settings import resolve_login_credentials
+
+        creds = await resolve_login_credentials(user_id, site)
+
+        # Always reply, even on failure to resolve — the bot has a 20s
+        # timeout waiting on this and treats "no answer" the same as "no
+        # credentials", but replying explicitly avoids relying on a client
+        # timeout for the normal "no login configured" case.
+        await websocket.send_text(
+            json.dumps({
+                "type": "login_answers",
+                "payload": {
+                    "session_id": session_id,
+                    "username": (creds or {}).get("username", ""),
+                    "password": (creds or {}).get("password", ""),
+                },
+            })
+        )
+
     async def handle_report_result(payload: dict):
         """
         Bot sends this after a fill+submit attempt completes. Writes a real
@@ -611,6 +641,8 @@ async def bot_ws(websocket: WebSocket):
                 await handle_report_problem(msg.get("payload", msg))
             elif msg_type == "scan_fields":
                 await handle_scan_fields(msg.get("payload", msg))
+            elif msg_type == "scan_login_fields":
+                await handle_scan_login_fields(msg.get("payload", msg))
             elif msg_type == "report_result":
                 await handle_report_result(msg.get("payload", msg))
             elif msg_type == "site_opened":
