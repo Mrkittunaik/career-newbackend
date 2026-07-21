@@ -55,17 +55,26 @@ SITE_BUILDERS = {
 NEEDS_UI_FILTERS = {"glassdoor", "monster", "ziprecruiter", "wellfound", "dice", "simplyhired"}
 
 
-def build_search_url(site_name: str, job_type: str, experience_level: str) -> dict:
+def build_search_url(site_name: str, job_type: str, experience_level: str, custom_sites: list[dict] | None = None) -> dict:
     """
-    Returns {"url": ..., "needs_ui_filters": bool}. Unknown sites fall back
-    to a Google site-search as a safe default rather than erroring out and
-    stalling the whole job-search session over one bad/unrecognized site
-    name (e.g. a typo the AI extracted from free-text chat).
+    Returns {"url": ..., "needs_ui_filters": bool}. Checks the user's saved
+    custom sites (added via the "+" tile on the dashboard) before falling
+    back to the built-in catalog, and finally to a Google site-search as a
+    safe default rather than erroring out and stalling the whole job-search
+    session over one bad/unrecognized site name.
     """
-    key = _site_key(site_name)
     exp = experience_level if experience_level in ("fresher", "experienced") else "any"
     query = quote_plus(job_type or "jobs")
 
+    lowered = site_name.strip().lower()
+    for site in custom_sites or []:
+        if site.get("title", "").strip().lower() == lowered:
+            # User-supplied site: open the exact URL they saved. No known
+            # query-param scheme for arbitrary sites, so experience_level
+            # filtering happens via apply_filters (bot-side UI clicks) instead.
+            return {"url": site["url"], "needs_ui_filters": True}
+
+    key = _site_key(site_name)
     builder = SITE_BUILDERS.get(key)
     if builder is None:
         return {
